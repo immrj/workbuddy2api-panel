@@ -218,7 +218,7 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
-// 请求记录行必须紧凑、可读，并带上调用来源（IP / UA）；来源缺失时以 — 兜底。
+// 请求记录行必须紧凑、可读，并带上调用来源（IP / 密钥 / UA）；来源缺失时以 — 兜底。
 func TestAppJSRequestLogFormatting(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -242,8 +242,8 @@ vm.runInContext(
   ctx
 );
 const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
-const good = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12, request_id: 'req-1', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0' };
-const noSource = { ...good, request_id: 'req-3', client_ip: '', user_agent: '' };
+const good = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12, request_id: 'req-1', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', api_key: 'sk-a****3f2', api_key_name: 'prod' };
+const noSource = { ...good, request_id: 'req-3', client_ip: '', user_agent: '', api_key: '', api_key_name: '' };
 const cached = { ...good, request_id: 'req-2', cache_hit_tokens: 2257, cache_miss_tokens: 43 };
 process.stdout.write(JSON.stringify({
   good: ctx.requestLogText(good),
@@ -262,9 +262,11 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("request log formatting node test failed: %v\n%s", err, out)
 	}
-	text := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
-	noSource := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
-	cached := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
+	// 密钥列夹在「来源 IP」与「User-Agent」之间（与表头同序）；无来源时占位 —，
+	// 宽度不能塌掉，否则整行看着像少了一列。
+	text := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | prod sk-a****3f2 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
+	noSource := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
+	cached := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | prod sk-a****3f2 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
@@ -752,7 +754,7 @@ process.stdout.write(JSON.stringify([
   has(out.prompt, 'file'), (out.prompt || {}).file,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
-  out.api_key
+  has(out, 'api_key'), has(out, 'api_keys')
 ]));`
 	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
 	if err != nil {
@@ -766,10 +768,81 @@ process.stdout.write(JSON.stringify([
 	if err != nil {
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
-	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
-	const want = `[true,"",true,"",false,false,"secret"]`
+	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发,
+	//  api_key 未发, api_keys 未发]
+	//
+	// 最后两项钉住"密钥不走 CFG_MAP"：密钥必须能删到**真的空**（空表 = 关闭鉴权），
+	// 而 CFG_MAP 的语义是"空 = 不下发"，用它永远发不出关闭鉴权这个状态。表单里
+	// 那个叫 api_key 的元素此刻是无人认领的死元素，它存在与否都不该影响输出。
+	const want = `[true,"",true,"",false,false,false,false]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSCollectKeys 钉住密钥表的收集语义：半填的行就地补齐，且补出来的值
+// 必须**写回输入框**。
+//
+// 两个理由，都是踩过的坑：
+//   - 空 key 是后端硬错误（normalizeAPIKeys 直接拒绝整次保存），前端不补齐就
+//     会让用户点一次保存、再从 400 错误里猜是哪一行；
+//   - 补齐只发生在内存里而不同步回屏幕的话，面板显示空值、磁盘上却是另一把
+//     随机密钥，下一次打开面板看到的东西和真正生效的东西对不上。
+//
+// 同名也在这里拦：后端要求名称唯一（日志与用量靠它分归属），留到服务端报 400
+// 等于让人猜。
+func TestAppJSCollectKeys(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; collectKeys test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function genKeyValue');
+const end = src.indexOf("$('btnKeyAdd')");
+if (start < 0 || end < 0 || end < start) throw new Error('collectKeys region not found');
+const mkRow = (name, key, on) => {
+  const els = { '.k-name': { value: name }, '.k-val': { value: key }, '.k-on': { checked: on } };
+  return { querySelector: sel => els[sel] || null, _els: els };
+};
+const rows = [mkRow('', '', true), mkRow('prod', 'sk-live', true), mkRow('old', 'sk-old', false)];
+const tb = { querySelectorAll: () => rows };
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  Math, Array, Object, String, Uint8Array,
+  crypto: { getRandomValues: a => a },
+  $: id => (id === 'cfgKeyList' ? tb : null),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.collectKeys=collectKeys;this.keysBad=keysBad;', ctx);
+const keys = ctx.collectKeys();
+process.stdout.write(JSON.stringify({
+  names: keys.map(k => k.name),
+  firstKeyGenerated: keys[0].key.indexOf('sk-') === 0 && keys[0].key.length > 10,
+  kept: [keys[1].key, keys[1].enabled, keys[2].key, keys[2].enabled],
+  writtenBack: [rows[0]._els['.k-name'].value === keys[0].name, rows[0]._els['.k-val'].value === keys[0].key],
+  dupBad: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }, { name: 'a', key: 'k3' }]) !== '',
+  uniqOk: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }]) === '',
+  emptyKeyBad: ctx.keysBad([{ name: 'a', key: '' }]) !== '',
+  emptyKeyMsg: ctx.keysBad([{ name: 'a', key: '' }]).indexOf('a') >= 0,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "cfgk-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("collectKeys node test failed: %v\n%s", err, out)
+	}
+	const want = `{"names":["密钥1","prod","old"],"firstKeyGenerated":true,"kept":["sk-live",true,"sk-old",false],` +
+		`"writtenBack":[true,true],"dupBad":true,"uniqOk":true,"emptyKeyBad":true,"emptyKeyMsg":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("collectKeys=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }
 
@@ -901,5 +974,109 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSSyncSessionKey 防自锁路径的四个分支（审查发现：这是最要命的一段零覆盖逻辑）。
+//
+// 背景：面板自身也用网关密钥鉴权，密钥存在 localStorage[LS_KEY]。若保存后 LS 里那把
+// 已被删除/停用而没人去改它，下一次 5 秒轮询就 401，而面板没有第二个入口能改 LS ——
+// 操作者被永久锁在门外。所以四种情形都必须行为正确：
+//
+//	A 当前密钥仍在且启用        → 什么都不做
+//	B 当前密钥没了，另有启用的  → 自动切换 + 提示（人不必知情也能继续用）
+//	C 表为空（= 刚关掉鉴权）    → 清 LS，且**不**弹门（弹门会把"已关鉴权"变成"进不去"）
+//	D 表非空但零个启用          → 弹门要人输（否则就是把自己锁死）
+//	E LS 里本来就没有           → 早退，不碰任何状态
+func TestAppJSSyncSessionKey(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; syncSessionKey test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function syncSessionKey');
+const end = src.indexOf("$('btnKeyAdd')");
+if (start < 0 || end < 0 || end < start) throw new Error('syncSessionKey region not found');
+
+const LS = 'wb2api_key';
+const store = {};
+const calls = { toast: [], openKey: 0 };
+const has = k => Object.prototype.hasOwnProperty.call(store, k);
+function setLS(v) { Object.keys(store).forEach(k => delete store[k]); if (v != null) store[LS] = v; }
+function reset() { calls.toast = []; calls.openKey = 0; }
+
+const ctx = {
+  LS_KEY: LS,
+  localStorage: {
+    getItem: k => (has(k) ? store[k] : null),
+    setItem: (k, v) => { store[k] = v; },
+    removeItem: k => { delete store[k]; },
+  },
+  toast: m => { calls.toast.push(String(m)); },
+  openKey: () => { calls.openKey++; },
+  String, Object, Array,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.syncSessionKey=syncSessionKey;', ctx);
+
+const out = {};
+
+// A 当前密钥仍在新表且启用 → 不动作
+setLS('sk-a'); reset();
+ctx.syncSessionKey(['sk-a'], [{ key: 'sk-a', enabled: true, name: 'A' }]);
+out.keepLS = store[LS];
+out.keepToast = calls.toast.length;
+out.keepGate = calls.openKey;
+
+// B 当前密钥被删，另有启用的 → 自动切换并点名提示
+setLS('sk-gone'); reset();
+ctx.syncSessionKey(['sk-gone'], [{ key: 'sk-b', enabled: true, name: 'B' }]);
+out.switchLS = store[LS];
+out.switchToast = calls.toast.length;
+out.switchNames = calls.toast.join(' ').indexOf('B') >= 0;
+out.switchGate = calls.openKey;
+
+// C 表为空 = 刚关掉鉴权 → 清 LS，不弹门
+setLS('sk-a'); reset();
+ctx.syncSessionKey(['sk-a'], []);
+out.emptyLS = has(LS);
+out.emptyToast = calls.toast.length;
+out.emptyGate = calls.openKey;
+
+// D 表非空但零个启用 → 必须弹门
+setLS('sk-a'); reset();
+ctx.syncSessionKey(['sk-a'], [{ key: 'sk-x', enabled: false, name: 'X' }]);
+out.noEnabledLS = store[LS];
+out.noEnabledGate = calls.openKey;
+out.noEnabledToast = calls.toast.length;
+
+// E LS 本来就没有 → 早退
+setLS(null); reset();
+ctx.syncSessionKey([], []);
+out.noLSGate = calls.openKey;
+out.noLSToast = calls.toast.length;
+
+process.stdout.write(JSON.stringify(out));`
+	f, err := os.CreateTemp(t.TempDir(), "syncsk-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("syncSessionKey node test failed: %v\n%s", err, out)
+	}
+	const want = `{"keepLS":"sk-a","keepToast":0,"keepGate":0,` +
+		`"switchLS":"sk-b","switchToast":1,"switchNames":true,"switchGate":0,` +
+		`"emptyLS":false,"emptyToast":0,"emptyGate":0,` +
+		`"noEnabledLS":"sk-a","noEnabledGate":1,"noEnabledToast":1,` +
+		`"noLSGate":0,"noLSToast":0}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("syncSessionKey=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
 }

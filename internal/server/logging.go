@@ -348,6 +348,11 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// apiKey / apiKeyName 由 withAuth 在鉴权成功后回填（不是采集来的，是"谁自称
+	// 是谁"）。方向是鉴权 → trace，因为 trace 建于 ServeHTTP、早于 mux 派发，
+	// 那一刻鉴权还没发生。apiKey 是掩码值，apiKeyName 是名称（关联用量维度用）。
+	apiKey     string
+	apiKeyName string
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -425,6 +430,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.APIKey = t.apiKey
+	e.APIKeyName = t.apiKeyName
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess

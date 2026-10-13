@@ -826,13 +826,16 @@ function renderRequestMetrics(m, entries) {
   renderRequestTable();
 }
 
-/* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
-   outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。 */
+/* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID/密钥做空格分词的 AND 包含匹配，
+   outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。
+   密钥进 haystack 是因为「谁打进来的」经常是排查第一问：名称给归属，掩码给肉眼
+   可认的那一段，两个都得能被搜到。 */
 function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id,
+      e && e.api_key, e && e.api_key_name]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -862,6 +865,14 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* reqKeyCell 「API 密钥」列。与 IP / UA 同款单行截断（完整值在行 title 里）：名称给
+   归属、掩码给肉眼比对的那一段，两者都在就都显示，缺一个也不脑补另一个。 */
+function reqKeyCell(e) {
+  const t = reqKeyText(e);
+  if (t === '—') return '<span class="muted">—</span>';
+  return '<span class="clip">' + esc(t) + '</span>';
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -879,19 +890,21 @@ function renderRequestTable() {
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + reqKeyCell(e) + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
       '<td class="num">' + reqTokenCell(e) + '</td>' +
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
+  }).join('') || '<tr><td colspan="11" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
-  // 而不是让人以为筛选坏了。
-  const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
+  // 而不是让人以为筛选坏了。密钥也算来源——关掉 client_ip 记录时它是唯一的线索，
+  // 若不计入，会对着一整屏"来源未记录"去开一个其实已经生效的开关。
+  const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent || e.api_key || e.api_key_name));
   $('reqCount').textContent = !reqEntries.length ? ''
     : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
       (hasSource ? '' : ' · 来源未记录');
@@ -932,6 +945,7 @@ function requestLogText(e) {
     e && e.model || '—',
     e && e.account || '—',
     e && e.client_ip || '—',
+    reqKeyText(e),
     e && e.user_agent || '—',
     fmtMs(e && e.duration_ms),
     fmtTok(token) + ' tok',
@@ -939,6 +953,16 @@ function requestLogText(e) {
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
     e && e.request_id || '—',
   ].filter(Boolean).join(' | ');
+}
+
+/* reqKeyText 密钥身份纯文本（表格单元格与行 title 共用一份，避免两处说法不一致）。
+   归档只存掩码（不落明文，见 reqlog.Event 的安全约定），而归属判断要靠名称，
+   所以把两者拼在一段；只有其一时就用那一个，绝不拿另一个字段脑补。 */
+function reqKeyText(e) {
+  const name = String(e && e.api_key_name || '');
+  const mask = String(e && e.api_key || '');
+  if (name && mask) return name + ' ' + mask;
+  return name || mask || '—';
 }
 
 /* 缓存命中率纯文本（issue #92）：requestLogText 与积分表/kpi 卡共用。
@@ -961,8 +985,15 @@ $('btnLogPin').onclick = () => {
 };
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
+/* CFG_MAP 标量字段与配置的对应关系（字段名 → 配置内路径）。
+ *
+ * 刻意不含 api_key / api_keys：两者都是"密钥表"，由密钥列表走独立读写路径
+ * （collectKeys），因为这里的语义是"空 = 不下发"，而密钥必须能删到**真的空**——
+ * 空列表等价于关闭鉴权，用 CFG_MAP 那套语义会永远发不出这个状态。
+ * api_key 则由 collectKeys 一并显式下发为 ""，否则磁盘上的旧单值会在合并时
+ * 复活成一条没人看见的「默认」密钥。 */
 const CFG_MAP = {
-  listen: ['listen'], api_key: ['api_key'],
+  listen: ['listen'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -996,8 +1027,7 @@ const CFG_MAP = {
  * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
  * 而值其实没变（issue #102 附带发现 2：user_agent 清空后 config.json 里仍是旧值）。
  *
- * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
- * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
+ * 密钥（api_key / api_keys）不在这里，走密钥列表的独立路径——见 CFG_MAP 上方注。
  */
 const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
 
@@ -1023,6 +1053,7 @@ async function loadConfig() {
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
+    renderKeyList(cfgLoaded); // 密钥表不走 CFG_MAP，单独回填（见 CFG_MAP 上方注）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -1071,11 +1102,170 @@ function markDurationFields() {
 $('cfgForm').addEventListener('input', ev => {
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
 });
+
+/* ── API 密钥表 ────────────────────────────────────────────────────────
+   刻意不走 CFG_MAP：那套的语义是"空 = 不下发"，而密钥必须能被删到**真的空**
+   （空表 = 不鉴权），用它永远发不出这个状态。这里的读写都直连表格 DOM。 */
+let cfgKeyRows = [];      // 最近一次由后端回填/重绘的密钥；编辑期以 DOM 为准
+let keyShown = false;     // 密钥值明文/掩码开关
+let keyNotice = '';       // collectKeys 补默认值的说明，供保存后一次性提示
+
+/* genKeyValue 生成一把建议密钥值。空 key 是后端硬错误（normalizeAPIKeys 直接
+   拒绝整次保存），所以"留空自动生成"必须在前端补齐，而不是让用户点一次保存、
+   再从 400 错误里猜是哪一行。 */
+function genKeyValue() {
+  try {
+    const a = new Uint8Array(12);
+    crypto.getRandomValues(a);
+    return 'sk-' + Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    // 刻意**不**降级到 Math.random：Math.random 不是密码学安全的，生成的密钥
+    // 可被预测，而界面上看不出任何区别——"看起来能用"的弱凭证比一次明确失败
+    // 危险得多。返回空串，由 keysBad 拦下并提示手填，后端对空 key 也会硬报错，
+    // 失败路径是闭环且可见的。
+    return '';
+  }
+}
+
+/* paintKeyRows 整表重绘。行内输入直接用 value 属性落值（esc 覆盖引号），事件走
+   容器委托，因此换掉子节点不会丢监听。 */
+function paintKeyRows() {
+  const tb = $('cfgKeyList');
+  if (!tb) return;
+  const inp = (cls, type, v, aria) =>
+    '<input class="' + cls + '" type="' + type + '" value="' + esc(v) + '" aria-label="' + esc(aria) + '">';
+  tb.innerHTML = cfgKeyRows.map((k, i) =>
+    '<tr>' +
+      '<td>' + inp('k-name', 'text', k.name, '第 ' + (i + 1) + ' 行密钥名称') + '</td>' +
+      '<td>' + inp('k-val', keyShown ? 'text' : 'password', k.key, '第 ' + (i + 1) + ' 行密钥值') + '</td>' +
+      '<td class="num"><input class="k-on" type="checkbox"' + (k.enabled ? ' checked' : '') +
+        ' aria-label="启用第 ' + (i + 1) + ' 行密钥"></td>' +
+      '<td class="c-acts"><button type="button" class="xs" data-kdel="' + i + '">删除</button></td>' +
+    '</tr>'
+  ).join('') || '<tr><td colspan="4" class="empty">尚无密钥 —— 该状态下 /v1/*、/status 与面板自身均不鉴权</td></tr>';
+}
+
+/* renderKeyList 用后端配置回填密钥表。老配置只有单值 api_key：显示成一条
+   「默认」行，否则面板显示"零密钥"而磁盘上还挂着一把——那正是"关不掉鉴权"
+   的错觉来源。 */
+function renderKeyList(cfg) {
+  const c = cfg || {};
+  const list = (Array.isArray(c.api_keys) && c.api_keys.length)
+    ? c.api_keys
+    : (c.api_key ? [{ name: '默认', key: c.api_key, enabled: true }] : []);
+  cfgKeyRows = list.map(k => ({
+    name: String(k && k.name || ''),
+    key: String(k && k.key || ''),
+    enabled: !(k && k.enabled === false),
+  }));
+  paintKeyRows();
+}
+
+/* readRows 把表格读成密钥数组：只搬运，不补默认值也不改写输入框——补默认值是
+   collectKeys 收集那一刻的事，中途重绘不能吃掉用户正在输入的内容。 */
+function readRows() {
+  const rows = [];
+  const tb = $('cfgKeyList');
+  if (!tb) return rows;
+  tb.querySelectorAll('tr').forEach(tr => {
+    const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val'), o = tr.querySelector('.k-on');
+    if (!n || !v) return;   // 空态那一行没有输入框
+    rows.push({ name: n.value.trim(), key: v.value.trim(), enabled: !!(o && o.checked) });
+  });
+  return rows;
+}
+
+/* collectKeys 收集即将保存的密钥表，并补齐两类"填一半"的输入：空名称与空值。
+   补出来的值要写回输入框，让"屏幕上这套"就是"存下去那套"——否则面板显示空
+   key、磁盘上却是一把随机密钥，下次打开变成另一把。 */
+function collectKeys() {
+  const rows = readRows();
+  const notes = [];
+  const tb = $('cfgKeyList');
+  rows.forEach((r, i) => {
+    if (!r.name) { r.name = '密钥' + (i + 1); notes.push('第 ' + (i + 1) + ' 行补了名称「' + r.name + '」'); }
+    if (!r.key) {
+      r.key = genKeyValue();
+      notes.push(r.key ? '第 ' + (i + 1) + ' 行生成了密钥值'
+                       : '第 ' + (i + 1) + ' 行无法安全生成密钥值（当前环境 crypto 不可用），请手工填写');
+    }
+    const tr = tb && tb.querySelectorAll('tr')[i];
+    if (tr) {
+      const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val');
+      if (n) n.value = r.name;
+      if (v) v.value = r.key;
+    }
+  });
+  keyNotice = notes.join('；');
+  return rows;
+}
+
+/* keysBad 同名校验。与后端 normalizeAPIKeys 同一口径，拦在发请求之前，
+   省得用户对着一条 400 猜是哪个框。 */
+function keysBad(rows) {
+  const seen = new Set(); // 用 Set 而不是 {}：键名里若出现 constructor/toString，
+  for (const k of rows) { // 对象字面量的原型链会让这些名字"看起来已存在"而被误判重复。
+    // 空值先拦：genKeyValue 在 crypto 不可用时会给空串，此时必须在面板里说清楚
+    // 是哪一行，而不是发出去让后端回一条 400 让用户自己猜。
+    if (!k.key) return '密钥「' + k.name + '」没有值：请手工填写，或删掉这一行（留空无法保存）。';
+    if (seen.has(k.name)) return '密钥名称「' + k.name + '」重复：名称是日志与用量里的归属标识，必须唯一。';
+    seen.add(k.name);
+  }
+  return '';
+}
+
+/* syncSessionKey 保存后把本次会话用的密钥对齐到新表。判据是"LS_KEY 里那把在新表
+   里是否仍然存在且启用"，不是"是否还写进磁盘"：被删或被停用的那把会在下一次
+   5 秒轮询时 401，而面板没有第二个入口能改 LS_KEY，锁在门外就再也回不来。
+   所以能自动换就自动换，一把能用的都没有才弹门要人输。 */
+function syncSessionKey(prevKeys, now) {
+  const cur = String(localStorage.getItem(LS_KEY) || '');
+  if (!cur) return;
+  if (now.some(k => k.key === cur && k.enabled)) return;
+  // 空表 = 关闭鉴权（后端 VerifyAnyBearer 对空表恒放行），残留的 LS 密钥无害；
+  // 这种情况下更不能弹门要人输——那会把"刚刚关掉鉴权"变成"面板进不去"。
+  if (!now.length) { localStorage.removeItem(LS_KEY); return; }
+  const pick = now.find(k => k.enabled);
+  if (pick) {
+    localStorage.setItem(LS_KEY, pick.key);
+    toast('本次会话密钥' + (prevKeys.includes(cur) ? '已被删除或停用' : '不在新列表中') +
+      '，已自动改用「' + pick.name + '」');
+    return;
+  }
+  openKey();
+  toast('已无可用密钥，请输入新的密钥，否则面板会持续 401。', 'err');
+}
+
+$('btnKeyAdd').onclick = () => {
+  // 先把已编辑但未保存的行收进内存，否则重绘会把用户刚打的名字吃掉。
+  cfgKeyRows = readRows();
+  const nameEl = $('keyNewName'), valEl = $('keyNewVal');
+  const name = nameEl.value.trim() || ('密钥' + (cfgKeyRows.length + 1));
+  cfgKeyRows.push({ name, key: (valEl.value.trim() || genKeyValue()), enabled: true });
+  nameEl.value = ''; valEl.value = '';
+  paintKeyRows();
+};
+$('keyNewVal').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKeyAdd').click(); });
+$('cfgKeyList').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-kdel]');
+  if (!b) return;
+  const i = Number(b.dataset.kdel);
+  if (!cfgKeyRows[i]) return;
+  cfgKeyRows = readRows();
+  const gone = cfgKeyRows[i];
+  // 删最后一行的语义不是"少一把"，是"关闭鉴权"，必须说清楚：不可逆且代价不小。
+  const tip = cfgKeyRows.length <= 1
+    ? '删除后将没有任何密钥，/v1/*、/status 与面板自身都不再鉴权（等于把网关公开）。确认删除？'
+    : '删除密钥「' + gone.name + '」？正在使用它的调用方会立即 401。';
+  if (!confirm(tip)) return;
+  cfgKeyRows.splice(i, 1);
+  paintKeyRows();
+});
 $('btnEye').onclick = () => {
-  const el = $('cfgKey');
-  const show = el.type === 'password';
-  el.type = show ? 'text' : 'password';
-  $('btnEye').textContent = show ? '隐藏' : '显示';
+  keyShown = !keyShown;
+  cfgKeyRows = readRows();
+  paintKeyRows();
+  $('btnEye').textContent = keyShown ? '隐藏值' : '显示值';
 };
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
@@ -1089,15 +1279,33 @@ $('cfgForm').onsubmit = async ev => {
     toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
     return;
   }
+  // 保存前的旧表快照：只用来事后判断"本会话那把密钥是被本次编辑删掉的"，
+  // 好给出准确提示。必须在 collectKeys 改写输入框之前取。
+  const prevKeys = cfgKeyRows.map(k => k.key);
+  const keys = collectKeys();
+  const bad = keysBad(keys);
+  if (bad) { toast(bad, 'err'); return; }
+  // 零个启用密钥 = 关闭整个鉴权（后端 HasEnabled 对"空表"与"全禁用"一视同仁，
+  // 都走未启用鉴权的放行分支）。删除路径已有二次确认，而"把最后一行的启用勾掉"
+  // 同样会走到这里，却没有任何警示——保存后网关立刻匿名可访问，且访问日志的
+  // 密钥列全空，排查时极易被误当成"日志功能坏了"。两条路径必须同样拦一次。
+  if (keys.length && !keys.some(k => k.enabled)) {
+    if (!confirm('当前没有任何启用的密钥。保存后 /v1/*、/status 与面板自身都不再鉴权，' +
+      '等于把网关公开给任何能访问到该端口的人。\n确认保存？')) return;
+  }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
-    const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
+    const payload = collectConfig();
+    payload.api_keys = keys;
+    // api_key 必须显式发空串：saveConfig 是浅合并，只发 api_keys 时磁盘上的旧
+    // api_key 会活成一条表里看不见的「默认」密钥，"删空 = 关掉鉴权"也就永远关不掉。
+    payload.api_key = '';
+    const r = await api('config', { method: 'POST', body: JSON.stringify(payload) });
     const n = (r.restart_required || []).length;
     toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-    // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    const k = $('cfgKey').value.trim();
-    if (k) localStorage.setItem(LS_KEY, k);
+    if (keyNotice) toast(keyNotice);
+    syncSessionKey(prevKeys, keys);
     loadConfig();
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
@@ -1883,6 +2091,9 @@ const US_DIMS = {
   account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
   model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
   realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  // 密钥维度带性能列（谁在压网关是这一维的主要问题），不带域列：密钥与域无
+  // 从属关系，硬凑一列只会整列空着。span = 7(基础) + 2(性能)。
+  key: { key: 'by_api_key', title: 'API 密钥', withRealm: false, withPerf: true, span: 9 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -1917,7 +2128,11 @@ function usTabsHtml(dims, active, counts) {
   }).join('');
 }
 
-const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域']];
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域'], ['key', '按密钥']];
+/* 积分维度的 tab 表同样只此一份：读取用量失败时要重画一遍 tab（那条路径拿不到
+   usageData），历史上就因为这里硬编码了第二份列表，加维度时漏改导致「按密钥」
+   恰好在出错时消失。 */
+const US_CREDIT_TABS = [['account', '按账号'], ['model', '按模型'], ['key', '按密钥']];
 
 function renderUsageDim() {
   const d = usageData || {};
@@ -1927,6 +2142,7 @@ function renderUsageDim() {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
     realm: (d.by_realm || []).length,
+    key: (d.by_api_key || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
   $('usDimBody').innerHTML = rows.map(x =>
@@ -1939,15 +2155,21 @@ function renderUsageDim() {
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
-/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
+/* 积分扣除：按账号 / 按模型 / 按密钥三个维度共用一张表（同上，多个 box 合成一个）。
+   三个分支必须写全：写成 `dim === 'model' ? A : B` 时，新增的 'key' 会安静地
+   拿到账号表头（"账号"列 + 7 格 colspan），行却按密钥渲染，整张表错位一列。 */
 function usCreditHead(dim) {
   return dim === 'model'
     ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
       '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+    : dim === 'key'
+      ? '<tr><th class="mark" aria-hidden="true"></th><th>API 密钥</th>' +
+        '<th class="num">请求</th><th class="num">扣除积分</th>' +
+        '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
+      : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
+        '<th class="num">请求</th><th class="num">扣除积分</th>' +
+        '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -1979,6 +2201,21 @@ function renderCreditDim() {
         '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
     ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
+  } else if (usCreditDim === 'key') {
+    // 密钥行只有一列标识：名称本身就是归属，域与倍率在此维度没有意义，后端也留空，
+    // 别去拼一个"看起来有信息"的子行。
+    const rows = d.credit_by_api_key || [];
+    $('usCreditBody').innerHTML = rows.map(row =>
+      '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td>' + esc(row.key || '—') + '</td>' +
+        '<td class="num">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+      '</tr>'
+    ).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
   } else {
     const accounts = d.credit_by_account || [];
     $('usCreditBody').innerHTML = accounts.map(row => {
@@ -1995,9 +2232,10 @@ function renderCreditDim() {
         '</tr>';
     }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
   }
-  $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+  $('usCreditTabs').innerHTML = usTabsHtml(US_CREDIT_TABS, usCreditDim, {
     account: (d.credit_by_account || []).length,
     model: (d.credit_by_model || []).length,
+    key: (d.credit_by_api_key || []).length,
   });
 }
 
@@ -2037,7 +2275,10 @@ function renderUsage(d) {
     ? String(usageData.window_from).replace('T', ' ').slice(0, 16) +
       (usageData.window_to ? ' → ' + String(usageData.window_to).replace('T', ' ').slice(0, 16) : ' → 现在')
     : '';
-  const note = (rangeEcho || winLabel ? (rangeEcho || winLabel) + ' · ' : '') +
+  const keySel = $('usKey');
+  const keyLabel = keySel && keySel.value ? '密钥「' + keySel.value + '」· ' : '';
+  const note = keyLabel +
+    (rangeEcho || winLabel ? (rangeEcho || winLabel) + ' · ' : '') +
     (usageData.buckets || 0) + ' 个分桶' +
     (usageData.since ? ' · 数据自 ' + usageData.since.replace('T', ' ') : '') +
     (usageData.file_bytes ? ' · 文件 ' + (usageData.file_bytes / 1024).toFixed(1) + ' KB' : '');
@@ -2055,7 +2296,8 @@ function renderUsage(d) {
       '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
   $('usCreditNote').textContent =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
-    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · ' +
+    (usageData.credit_by_api_key || []).length + ' 个密钥 · 仅统计与积分同时观测到的 Token';
 
   renderUsageDim();
   renderCreditDim();
@@ -2287,9 +2529,14 @@ async function warmUsageModelRates() {
 
 async function loadUsage() {
   const q = trangeQuery('usRange', true);
+  // 密钥筛选（空 = 全部）。按**名称**传，与 usage 的维度键一致；名称不是机密。
+  // 筛选在服务端做，所以 totals / 趋势图 / 各维度 / 积分全部同口径，
+  // 不会出现"总览是一把密钥、曲线却是全站"的错位。
+  if ($('usKey') && $('usKey').value) q.set('key', $('usKey').value);
   try {
     await warmUsageModelRates();
     const d = await api('usage?' + q.toString());
+    renderUsageKeyFilter(d);
     renderUsage(d);
   } catch (e) {
     // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
@@ -2304,12 +2551,34 @@ async function loadUsage() {
     $('usDimHead').innerHTML = '';
     $('usCreditHead').innerHTML = '';
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
-    $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
+    $('usCreditTabs').innerHTML = usTabsHtml(US_CREDIT_TABS, usCreditDim, null);
     $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
 }
 
+/* renderUsageKeyFilter 总览的密钥下拉框。
+ *
+ * 选项来源是后端的 key_options —— 它是**不受筛选影响**的窗口内全集。若改用被筛选
+ * 过的 by_api_key 当选项，选中一把之后选项就只剩它自己，用户再也切不回别的密钥。
+ *
+ * 选项集合没变就不重写 innerHTML：每次 5 秒轮询都重写会让正在展开的下拉框闪断，
+ * 也会把用户的键盘焦点顶掉。
+ */
+function renderUsageKeyFilter(d) {
+  const sel = $('usKey');
+  if (!sel) return;
+  const opts = (d && d.key_options) || [];
+  const want = ['', ...opts];
+  const have = Array.prototype.map.call(sel.options, o => o.value);
+  if (have.join('\u0000') === want.join('\u0000')) return;
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">全部密钥</option>' +
+    opts.map(k => '<option value="' + esc(k) + '">' + esc(k) + '</option>').join('');
+  sel.value = want.indexOf(keep) >= 0 ? keep : '';
+}
+
+if ($('usKey')) $('usKey').addEventListener('change', loadUsage);
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 // 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
 if ($('usRange')) trangeBind('usRange', loadUsage);

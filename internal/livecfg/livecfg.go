@@ -13,9 +13,16 @@ import (
 	"time"
 )
 
+// APIKey 一条鉴权密钥（与 httpauth.APIKey 同形，让本包不必依赖网关包）。
+type APIKey struct {
+	Name    string
+	Key     string
+	Enabled bool
+}
+
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	APIKeys              []APIKey      // 网关/面板共同鉴权密钥表；无启用项 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
@@ -34,14 +41,25 @@ func New(s Snapshot) *Holder {
 }
 
 // Load 返回当前快照（Holder 为 nil 或从未 Store 时返回零值快照，调用方无需判空）。
+//
+// APIKeys 切片**在返回前拷贝**：Snapshot 是值拷贝（*s），但切片头会让读者与
+// Holder 内部共享同一块底层数组——面板渲染密钥列表时若对返回值做 sort.Slice，
+// 就会与每个并发请求的数据竞争。拷贝必须在 Load 侧：Store 收到的切片可能已被
+// 别处持有，替它拷贝保护不了读者；只有读者侧拷贝才能兑现"快照不可变"。
 func (h *Holder) Load() Snapshot {
 	if h == nil {
 		return Snapshot{}
 	}
-	if s := h.p.Load(); s != nil {
-		return *s
+	s := h.p.Load()
+	if s == nil {
+		return Snapshot{}
 	}
-	return Snapshot{}
+	out := *s
+	if len(s.APIKeys) > 0 {
+		out.APIKeys = make([]APIKey, len(s.APIKeys))
+		copy(out.APIKeys, s.APIKeys)
+	}
+	return out
 }
 
 // Store 整体替换快照。

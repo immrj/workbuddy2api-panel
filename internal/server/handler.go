@@ -30,10 +30,13 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// APIKeys 静态密钥表（Live 为 nil 时的回退；与 Live 同时给出时 Live 优先）。
+	// 保留旧单键 APIKey 字段是为了让既有测试 fixture 与静态装配代码零改动。
+	APIKey    string
+	APIKeys   []httpauth.APIKey
+	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -82,7 +85,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
+		APIKeys:          toLiveKeys(h.staticKeys()),
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
@@ -170,12 +173,66 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		key, ok := httpauth.VerifyAnyBearer(r, h.loadKeys())
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		// 回填到请求 trace，供日志记录"这条请求是谁发起的"。
+		//
+		// 方向只能是"鉴权时写 trace"，不能反过来在 trace 构造时从 context 读：
+		// ServeHTTP 先建 trace 并塞 context（handler.go:149-154），再把请求交给
+		// mux 派发，withAuth 是在派发内部才跑的——trace 构造那一刻，鉴权尚未发生。
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.apiKey = logfmt.MaskKey(key.Key)
+			tr.apiKeyName = key.Name
+		}
 		next(w, r)
 	}
+}
+
+// loadKeys 当前生效密钥表：配了 Live 就以 Live 为准，否则回落静态字段。
+func (h *Handler) loadKeys() []httpauth.APIKey {
+	// 判据必须是"有没有配 Live"，**不能**是"Live 里的密钥表非空"。
+	//
+	// 空表是一个有意义的状态——用户在面板里删光所有密钥就是在关闭鉴权。
+	// 若用 len(...)>0 当判据，删光密钥会落回 staticKeys() 的启动期快照，于是
+	// "关闭鉴权"在数据面上完全不起作用：磁盘上空表、面板进得去（面板按
+	// Live!=nil 判），网关却仍拿启动时的旧密钥继续 401。两侧行为分裂、无任何
+	// 报错，只有真去访问网关才会发现。
+	if h.cfg.Live != nil {
+		live := h.cfg.Live.Load()
+		out := make([]httpauth.APIKey, 0, len(live.APIKeys))
+		for _, k := range live.APIKeys {
+			out = append(out, httpauth.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+		}
+		return out
+	}
+	return h.staticKeys()
+}
+
+// toLiveKeys httpauth.APIKey → livecfg.APIKey 的类型搬运。两包刻意各自定义
+// 结构体：livecfg 是被 server 与 panel 共同依赖的最底层包，让它反过来 import
+// httpauth 会把一个网关概念沉进通用配置层。
+func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
+	if len(ks) == 0 {
+		return nil
+	}
+	out := make([]livecfg.APIKey, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, livecfg.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+	}
+	return out
+}
+
+// staticKeys 静态密钥表（Live 未配置时的回退），兼容旧的单键 APIKey 字段。
+func (h *Handler) staticKeys() []httpauth.APIKey {
+	out := make([]httpauth.APIKey, 0, len(h.cfg.APIKeys)+1)
+	out = append(out, h.cfg.APIKeys...)
+	if h.cfg.APIKey != "" {
+		out = append(out, httpauth.APIKey{Name: "默认", Key: h.cfg.APIKey, Enabled: true})
+	}
+	return out
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -657,7 +714,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 				realm = a.Realm
 			}
-			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+			// 密钥维度取自 requestTrace（withAuth 鉴权时回填的名称）。为空时
+			// AddWithKey 会归一到"默认"，与存量数据保持同一归属口径。
+			var apiKeyName string
+			if tr := requestTraceFrom(r); tr != nil {
+				apiKeyName = tr.apiKeyName
+			}
+			h.cfg.Usage.AddWithKey(time.Now(), realm, uid, delta.Model, apiKeyName, usage.Delta{
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
 				CompletionTokens: delta.CompletionTokens,

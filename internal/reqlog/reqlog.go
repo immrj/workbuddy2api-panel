@@ -80,10 +80,18 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	// APIKey 是**掩码值**（logfmt.MaskKey：前 3 + 后 3 + 中间 *），供面板展示与
+	// 人工辨认"是哪一把密钥"。刻意不落明文——归档文件会被备份、传输、贴工单，
+	// 明文密钥留在里面等于把凭证散落在各处，与本包的脱敏约定冲突。
+	APIKey string `json:"api_key,omitempty"`
+	// APIKeyName 是密钥的**名称**（运营自取，如 "prod" / "staging"），不是机密。
+	// 它是跨视图的关联键：usage 桶按名称聚合，用量与日志靠它对上同一批请求。
+	// 名称可能重复被人为搞乱，但 normalize 会拦住重名，所以可当稳定身份用。
+	APIKeyName string `json:"api_key_name,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -95,8 +103,13 @@ type Filter struct {
 	Model     string
 	ClientIP  string
 	UserAgent string
-	From      time.Time
-	To        time.Time
+	// APIKey 按掩码值"包含"匹配（与 ClientIP 同款，捞"同一把密钥的请求"）。
+	APIKey string
+	// APIKeyName 按名称**精确**匹配。名称不含机密，做精确而非包含，
+	// 免得 "prod" 命中 "prod-eu" 造成误筛。
+	APIKeyName string
+	From       time.Time
+	To         time.Time
 }
 
 // ArchiveStats 归档存储状态。
@@ -583,6 +596,13 @@ func (f Filter) match(e Event) bool {
 		return false
 	}
 	if !containsFold(e.UserAgent, f.UserAgent) {
+		return false
+	}
+	if !containsFold(e.APIKey, f.APIKey) {
+		return false
+	}
+	// 名称走精确：containsFold 会让 "prod" 命中 "prod-eu"，误筛比漏筛更难排查。
+	if f.APIKeyName != "" && e.APIKeyName != f.APIKeyName {
 		return false
 	}
 	if !f.From.IsZero() && e.Time.Before(f.From) {

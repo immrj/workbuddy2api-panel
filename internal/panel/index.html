@@ -173,9 +173,14 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 input.invalid { border-color: var(--bad); background: var(--bad-soft); }
 input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
-label.fld { display: block; margin-bottom: 14px; }
-label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
-label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+/* .fld 不限 label：密钥表那一块包着整张表和按钮，用 label 套住会让点击任意空白
+   都把焦点甩到第一个输入框上，所以那里是 div.fld，选择器必须一起放宽。 */
+.fld { display: block; margin-bottom: 14px; }
+.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
+.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+/* 密钥新增行：输入默认 width:100%，两个等宽各占一半会把长密钥挤成一截。 */
+#keyNewName { flex: 0 0 24%; }
+#keyNewVal { flex: 1 1 auto; min-width: 0; }
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
@@ -541,7 +546,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .trange { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .trange .tr-custom { display: inline-flex; align-items: center; gap: 6px; }
   .trange .tr-sep { color: var(--ink-3); font-size: 12px; }
-  .trange select, .trange input { width: auto; padding: 5px 9px; font-size: 12.5px; border-radius: 6px; }
+  /* .hsel：页头里的独立下拉（如用量总览的密钥筛选）。与区间控件的 select 共用
+     同一条规则而不是各写一份数值——两处一旦分开维护，改了一边就会出现"两个下拉
+     框高度差 1px"这种只能靠肉眼发现的细微不一致。 */
+  .trange select, .trange input, .hsel { width: auto; padding: 5px 9px; font-size: 12.5px; border-radius: 6px; }
   .trange input[type=datetime-local] { font-family: var(--mono); font-size: 12px; }
   /* 原生日期选择器的弹出面板要跟随明暗主题，否则深色下是一块刺眼的白。 */
   .trange input[type=datetime-local] { color-scheme: light; }
@@ -823,6 +831,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="usNote">—</span>
           <span class="trange" id="usRange"></span>
+          <select id="usKey" class="hsel" aria-label="按 API 密钥筛选用量">
+            <option value="">全部密钥</option>
+          </select>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
         <div class="kpis" id="usStats"></div>
@@ -899,14 +910,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">监听地址</span>
                 <input name="listen" placeholder=":7863">
                 <span class="hint">改动需重启进程</span></label>
-              <label class="fld"><span class="lb">API 密钥</span>
-                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
-                <button type="button" class="xs" id="btnEye">显示</button></div>
-                <span class="hint">立即生效（含面板自身）</span></label>
+              <div class="fld"><span class="lb">单账号明细默认展示条数</span>
+                <input name="package_detail_limit" type="number" min="1" placeholder="5">
+                <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></div>
             </div>
-            <label class="fld"><span class="lb">单账号明细默认展示条数</span>
-              <input name="package_detail_limit" type="number" min="1" placeholder="5">
-              <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+            <!-- 密钥表独立成块，不放 grid2：每行有名称/值/启用/删除四列，压到半栏
+                 会让密钥值只剩几十像素。它是整页最需要横向空间的表单区。 -->
+            <div class="fld"><span class="lb">API 密钥</span>
+              <div class="tbl-wrap">
+                <table class="acc zebra">
+                  <thead><tr>
+                    <th>名称</th><th>密钥值</th><th class="c-acts">启用</th><th class="c-acts">操作</th>
+                  </tr></thead>
+                  <tbody id="cfgKeyList"></tbody>
+                </table>
+              </div>
+              <div class="inline">
+                <input id="keyNewName" placeholder="新密钥名称" aria-label="新密钥名称">
+                <input id="keyNewVal" placeholder="留空自动生成" aria-label="新密钥值">
+                <button type="button" class="xs" id="btnKeyAdd">添加密钥</button>
+                <button type="button" class="xs" id="btnEye">显示值</button>
+              </div>
+              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。全删 = 关闭鉴权。</span>
+            </div>
           </div>
         </div>
 
@@ -1095,7 +1121,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="reqNote">—</span>
         </header>
         <div class="fbar" id="reqFilter">
-          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
+          <input id="reqQ" type="search" placeholder="搜索 IP / 密钥 / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
           <select id="reqOutcome" aria-label="按结果筛选">
             <option value="">全部结果</option>
             <option value="success">成功</option>
@@ -1117,7 +1143,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <table class="acc req">
             <thead><tr>
               <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
-              <th>来源 IP</th><th>User-Agent</th>
+              <th>来源 IP</th><th>API 密钥</th><th>User-Agent</th>
               <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>

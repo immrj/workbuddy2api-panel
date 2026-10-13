@@ -355,7 +355,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 单条网关鉴权密钥（**向后兼容的旧字段**）；空 = 不鉴权。新配置建议改用 `api_keys` |
+| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**，任一启用密钥都能通过网关与面板鉴权；**生效表中没有启用的密钥（表为空或全部停用）= 不鉴权** |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -627,7 +628,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 http://127.0.0.1:7863/panel/
 ```
 
-鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
+鉴权与 API 同口径：生效密钥表里**至少有一把启用密钥**时，面板要求输入一次密钥（浏览器 localStorage 记住），填**任意一把**启用的密钥都可以；一把启用的都没有则直接可用。
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
 
 | 视图 | 功能 |
@@ -657,7 +658,7 @@ http://127.0.0.1:7863/panel/
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
-**配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key` / `api_keys`（增删密钥、启停密钥**下一个请求即生效，无需重启**）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -687,12 +688,14 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
+| `POST /v1/chat/completions` | Bearer（有启用密钥时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `GET /v1/models` | Bearer（有启用密钥时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
+| `GET /status` | Bearer（有启用密钥时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：生效密钥表（`api_keys` 的启用项 + 旧 `api_key`）中**至少有一把启用密钥**时才校验 `Authorization: Bearer <key>`，匹配任意一把即通过；启用密钥为零（表为空或全部 `enabled: false`）时上述端点**直接放行**；`/healthz` 恒无鉴权。
+>
+> 密钥值两端空白会被自动裁剪；`api_keys` 内空 `key`、重复 `key` 值、重复 `name` 都会导致配置被判非法（启动/保存报错），这是刻意的——名称重复会让两个凭证的统计按名称静默合并。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
@@ -836,7 +839,8 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 ### 2. 网络暴露与日志敏感度
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
-- 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
+- **任一把网关密钥都等同于管理凭证**：面板 `/panel/api/*`（含读取与改写配置）与网关**共用同一张密钥表**，因此持有任意一把启用密钥即可在「配置」页读到**其余所有密钥的明文**，并可增删/停用它们。这是单 `api_key` 时代语义的自然延续（那时唯一的密钥本就是根凭证），但多密钥之后含义变了：**不要把面板暴露到不受信网络，也不要把网关密钥交给只应调用 `/v1/chat/completions` 的第三方**。若需要按租户分发密钥，请为面板单独前置一层访问控制
+- 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / **API 密钥（掩码，形如 `sk-a****3f2`）与密钥名称** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头；密钥只落掩码，长度 ≤ 6 时全掩码）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 
 ### 3. 发布来源与合规边界

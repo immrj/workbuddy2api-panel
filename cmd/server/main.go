@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -45,6 +46,20 @@ func stateSibling(stateFile, name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
+}
+
+// toLiveKeys httpauth.APIKey → livecfg.APIKey 的类型搬运（main 侧装配用）。
+// 与 internal/server 里的同名函数各自一份：那是 server 包内部细节，这里是装配层
+// 的搬运，跨包导出一个只为一处的转换函数不值得。
+func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
+	if len(ks) == 0 {
+		return nil
+	}
+	out := make([]livecfg.APIKey, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, livecfg.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+	}
+	return out
 }
 
 func main() {
@@ -233,7 +248,7 @@ func main() {
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
+		APIKeys:              toLiveKeys(cfg.EffectiveAPIKeys()),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -269,7 +284,7 @@ func main() {
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
+		APIKeys:     cfg.EffectiveAPIKeys(),
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
@@ -294,7 +309,7 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
-		APIKey:       cfg.APIKey,
+		APIKeys:      cfg.EffectiveAPIKeys(),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -348,7 +363,7 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	log.Printf("workbuddy2api listening on %s (api_keys=%d)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, len(cfg.EffectiveAPIKeys()), panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
@@ -480,7 +495,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
+		APIKeys:              toLiveKeys(newCfg.EffectiveAPIKeys()),
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,

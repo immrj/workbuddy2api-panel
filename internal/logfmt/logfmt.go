@@ -66,6 +66,28 @@ func Label(uid, nick string) string {
 	return nick + "(" + short + ")"
 }
 
+// MaskKey 把密钥掩码成"前 3 + 后 3 + 中间星号"，用于日志与面板里的安全回显。
+//
+// 为什么掩码：密钥是调用方凭证，落盘归档或抄进工单就必须可辨认**是哪一把**，
+// 又不能留下可直接使用的明文。归属由名称（httpauth.APIKey.Name）承担，
+// 掩码值只回答"是不是这一把"。
+//
+// 边界：长度 <= 6 一律全掩码。此长度下"前 3 + 后 3"会覆盖整个密钥——
+// len=6 时掩码与原文完全相同，等于没掩。所以阈值取 <= 6（而非 < 7），
+// 让"看似掩码实则明文"的情况根本不会发生。
+//
+// 空串返回空串：调用方基本都是 omitempty 场景，空串与"没有密钥"本就同义，
+// 返回非空星号反而会在日志里留下一行莫名其妙的 "***"。
+func MaskKey(k string) string {
+	if k == "" {
+		return ""
+	}
+	if len(k) <= 6 {
+		return strings.Repeat("*", len(k))
+	}
+	return k[:3] + strings.Repeat("*", len(k)-6) + k[len(k)-3:]
+}
+
 // DisplayWidth 返回 s 的终端显示列宽：CJK / 全角 / emoji 记 2 列，其余记 1 列。
 //
 // 存在意义：账号昵称是用户自定的中文（"猫" 是 3 字节但占 2 列，"sample" 是 6 字节占

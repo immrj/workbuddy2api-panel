@@ -12,15 +12,93 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
+// APIKeyEntry config.json 中的一条密钥。
+//
+// Enabled 用指针而非 bool：JSON 无法区分"用户显式写了 false"与"这个键根本没写"。
+// 指针让后者（nil）能安全地默认成 true，既照顾老配置（api_keys 手写时通常不写
+// enabled），又不改变用户显式禁用（false）的意图。
+type APIKeyEntry struct {
+	Name    string `json:"name"`
+	Key     string `json:"key"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+// enabled 归一：nil 视为启用。
+func (e APIKeyEntry) enabled() bool { return e.Enabled == nil || *e.Enabled }
+
+// DefaultKeyName 兜底密钥名。用于旧 api_key 单值、以及历史 usage 桶的迁移归属。
+const DefaultKeyName = "默认"
+
+// effectiveAPIKeys 由 (api_keys 表, 旧 api_key 单值) 规整出生效密钥表。
+//
+// normalize 与 EffectiveAPIKeys 共用这一个构造点：把"被校验的那份"和"被使用的
+// 那份"收敛成同一段代码。此前两处各写一遍，导致 normalize 只看得见 c.APIKeys、
+// 看不见由 api_key 合成的条目，于是两个不同凭证可以共用同一个名称——而名称正是
+// usage 分桶与 reqlog 关联的键，后果是两份统计静默合并。
+//
+// 规则（顺序即优先级）：
+//  1. api_keys 非空 → 以它为准；若其中不含 api_key 的值，把 api_key 追加为
+//     一项（名称 DefaultKeyName）。这样"老字段仍然有效"对"只在新表里加了几个
+//     密钥、忘了搬老密钥"的用户依然成立。
+//  2. api_keys 为空、api_key 非空 → 单值包成一项（老配置的常态路径）。
+//  3. 两者都空 → 空表，等价于"未启用鉴权"（既有行为，不得回归）。
+//
+// 密钥值两端空白会被裁掉：判空用的是 TrimSpace，存值也必须用裁过的，否则手写
+// 配置里一个多余空格会让客户端必须逐字节带上空格才能通过鉴权。
+func effectiveAPIKeys(entries []APIKeyEntry, legacy string) []httpauth.APIKey {
+	var out []httpauth.APIKey
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		key := strings.TrimSpace(e.Key)
+		if key == "" {
+			continue
+		}
+		name := strings.TrimSpace(e.Name)
+		if name == "" {
+			name = DefaultKeyName
+		}
+		out = append(out, httpauth.APIKey{
+			Name:    name,
+			Key:     key,
+			Enabled: e.enabled(),
+		})
+		seen[key] = true
+	}
+	if legacy = strings.TrimSpace(legacy); legacy != "" && !seen[legacy] {
+		out = append(out, httpauth.APIKey{
+			Name:    DefaultKeyName,
+			Key:     legacy,
+			Enabled: true,
+		})
+	}
+	return out
+}
+
+// EffectiveAPIKeys 生效密钥表（纯只读投影）。
+//
+// 绝不把结果写回 c.APIKeys：WriteDefault 会先置 c.APIKey 再 normalize 再序列化，
+// 若这里回填，首次生成的 config.json 会在 api_key 与 api_keys[0].key 两处写下
+// 同一个机密。
+func (c *Config) EffectiveAPIKeys() []httpauth.APIKey {
+	if c == nil {
+		return nil
+	}
+	return effectiveAPIKeys(c.APIKeys, c.APIKey)
+}
+
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen string `json:"listen"` // ":7863"
+	// APIKey 单条密钥（向后兼容的老字段）。语义等价于密钥表里的一项；
+	// 两者都为空 = 不鉴权。新配置建议改用 APIKeys。
+	APIKey    string        `json:"api_key"`
+	APIKeys   []APIKeyEntry `json:"api_keys,omitempty"` // 多密钥表
+	AuthDir   string        `json:"auth_dir"`           // ./auths
+	StateFile string        `json:"state_file"`         // ./data/state.json
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -453,6 +531,9 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
@@ -603,6 +684,39 @@ func (c *Config) normalize() error {
 // custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
 // （两模式共用同一加载路径，PromptText 均非空）。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// normalizeAPIKeys 密钥表校验。
+//
+//	只校验**名字**与**空值**两件事，刻意不校验强度：既有单键 api_key 从来没做过
+//	强度要求，这里保持同一口径，避免升级后旧配置突然被判非法而无法启动。
+//	真正的问题（面板上多个密钥同名）必须在保存入口拦住，否则日志/用量里两个
+//	同名密钥无法区分归属。
+func (c *Config) normalizeAPIKeys() error {
+	// 第一轮：逐条字段校验（空值 / 重复密钥值）。报错带下标，便于用户定位到行。
+	keys := make(map[string]bool, len(c.APIKeys))
+	for i, e := range c.APIKeys {
+		k := strings.TrimSpace(e.Key)
+		if k == "" {
+			return fmt.Errorf("api_keys[%d] (name=%q): key 不能为空；留空表示不启用鉴权，请删掉这一项而不是留空 key", i, e.Name)
+		}
+		if keys[k] {
+			return fmt.Errorf("api_keys[%d] (name=%q): key 值重复，同一个密钥不能登记两次", i, e.Name)
+		}
+		keys[k] = true
+	}
+
+	// 名称唯一性以**生效表**为准，而不是 c.APIKeys。
+	names := make(map[string]bool, len(c.APIKeys)+1)
+	for _, k := range effectiveAPIKeys(c.APIKeys, c.APIKey) {
+		if names[k.Name] {
+			return fmt.Errorf("密钥名 %q 重复；名称是日志与用量里的归属标识，必须唯一"+
+				"（同一 api_keys 表内不能重名；旧字段 api_key 会自动以名称 %q 合并进生效表，若与之冲突请改名或清空 api_key）",
+				k.Name, DefaultKeyName)
+		}
+		names[k.Name] = true
+	}
+	return nil
+}
+
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":

@@ -41,10 +41,60 @@ const (
 	dayLayout  = "2006-01-02"
 )
 
+// defaultKeyName 密钥名缺省值。
+//
+// 用它承载两件事：调用方没给密钥名时（Add 的老签名），以及**历史桶迁移**——
+// 加密钥维度之前落盘的 usage.json 里所有桶都没有这个字段，加载后统一归到它，
+// 这样存量统计不丢（用户已确认的归属策略）。它是名称不是机密，可以安全落盘。
+const defaultKeyName = "默认"
+
+// bucketSep 复合桶键的分隔符。
+//
+// 用 NUL 而不是可打印字符（如 "|"）：密钥名是面板里自由输入的文本，realm/model
+// 又是上游可控的，任何可打印分隔符都可能被名字内容"撞"出来——例如名为 "prod|eu"
+// 的密钥会让 (realm=a|b, key=c) 与 (realm=a, key=b|c) 拼出同一个字符串，于是两个
+// 不同的桶在 map 里互相覆盖，静默丢数据。NUL 不会出现在这些字段的正常取值里，
+// 从根上消除这类碰撞，比事后校验"名字不许含 |"更彻底。
+//
+// 这与本包既有的复合键写法一致（见 SnapshotWindow 里的 cacheKey/modelKey 也用 "\x00"）。
+//
+// 注意：桶键只存在于内存 map，落盘用的是 bucket 结构体的独立字段（s/r/u/m/x/k），
+// 所以改分隔符**不需要数据迁移**。
+const bucketSep = 0
+
+// bucketKey 桶的唯一身份。**Add / Rollup / load 三处必须共用这一个函数。**
+//
+// 为什么强调唯一：这三处各自拼过一遍同形状的字符串键。任何一处漏改或字段顺序
+// 不一致，后果都是静默的——同形状的两个桶会在 map 里互相覆盖（Add）、折叠成一个
+// 日桶（Rollup）、或重启后从磁盘重建时挤掉彼此（load）。这类错误不报错、不崩溃，
+// 只是数字慢慢变得不对，要等 90 天后小时桶折叠才暴露，恢复不了。故单点收敛。
+func bucketKey(scope, realm, uid, model, rate, key string) string {
+	var b strings.Builder
+	// 预分配：桶数可达数十万，每次都拼一遍字符串，容量估少了会反复扩容。
+	b.Grow(len(scope) + len(realm) + len(uid) + len(model) + len(rate) + len(key) + 5)
+	b.WriteString(scope)
+	b.WriteByte(bucketSep)
+	b.WriteString(realm)
+	b.WriteByte(bucketSep)
+	b.WriteString(uid)
+	b.WriteByte(bucketSep)
+	b.WriteString(model)
+	b.WriteByte(bucketSep)
+	b.WriteString(rate)
+	b.WriteByte(bucketSep)
+	b.WriteString(key)
+	return b.String()
+}
+
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
-// 旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 4
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计，版本 5 增加
+// API 密钥维度（bucket.Key）；旧版本缺失字段按零值加载，旧数据不会丢弃。
+//
+// 注意它是**只写标记**：load() 从不读 Version 做分支，兼容性靠"缺字段即零值"
+// 这一条兜底。所以真正做存量迁移的是 load() 里那段 b.Key == "" 的字段值迁移，
+// 与这个数字无关——不要因为改了版本号就以为迁移跟着生效了，也不要反过来
+// 在迁移里依赖它判断。
+const fileVersion = 5
 
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
@@ -54,6 +104,7 @@ type bucket struct {
 	UID   string  `json:"u"`            // 账号 uid
 	Model string  `json:"m"`            // 上游裸模型名
 	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Key   string  `json:"k,omitempty"`  // API 密钥名（非机密；旧桶为空，加载时迁移为 defaultKeyName）
 	Req   int64   `json:"q"`            // 请求数（含失败）
 	Err   int64   `json:"e"`            // 失败数
 	PT    int64   `json:"p"`            // prompt tokens
@@ -149,20 +200,30 @@ type Delta struct {
 	HasCredit        bool
 	ModelRate        string
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
+// Add 记录一次请求用量。**保留原签名**（包内 22 处测试调用点 + 外部装配零改动），
+// 委托给 AddWithKey 且不带密钥维度。
 func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+	r.AddWithKey(now, realm, uid, model, "", d, ok)
+}
+
+// AddWithKey 记录一次请求用量，并归属到指定的 API 密钥名。
+//
+// key 为空时归一为 defaultKeyName——统一在一个入口做归一，避免"空名"与
+// "默认名"在下游变成分桶的两个来源（那会让同一批请求看起来来自两把密钥）。
+func (r *Recorder) AddWithKey(now time.Time, realm, uid, model, key string, d Delta, ok bool) {
 	if r == nil {
 		return
 	}
@@ -172,16 +233,19 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	if model == "" {
 		model = "(unknown)"
 	}
+	if key == "" {
+		key = defaultKeyName
+	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	bk := bucketKey(scope, realm, uid, model, d.ModelRate, key)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	b := r.buckets[key]
+	b := r.buckets[bk]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
-		r.buckets[key] = b
+		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate, Key: key}
+		r.buckets[bk] = b
 	}
 	b.Req++
 	if !ok {
@@ -247,7 +311,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
+		moves = append(moves, move{from: k, to: bucketKey(day, b.Realm, b.UID, b.Model, b.Rate, b.Key)})
 	}
 	for _, m := range moves {
 		src := r.buckets[m.from]
@@ -298,9 +362,14 @@ func (r *Recorder) load() error {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return err
 	}
+	// 字段值迁移（不依赖 fileVersion —— 它只写不读，见下）：加密钥维度之前落盘的
+	// 桶没有 Key 字段，统一归入 defaultKeyName，存量统计一个不丢。
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
+		if b.Key == "" {
+			b.Key = defaultKeyName
+		}
+		r.buckets[bucketKey(b.Scope, b.Realm, b.UID, b.Model, b.Rate, b.Key)] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 	return nil
@@ -464,18 +533,39 @@ func (a *creditAcc) finish() CreditAgg {
 	return out
 }
 
+// sortedKeys 把集合转成排序后的切片。下拉框选项必须顺序稳定。
+func sortedKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals          Agg         `json:"totals"`
-	ByRealm         []KeyedAgg  `json:"by_realm"`
-	ByAccount       []KeyedAgg  `json:"by_account"`
-	ByModel         []KeyedAgg  `json:"by_model"`
+	Totals    Agg        `json:"totals"`
+	ByRealm   []KeyedAgg `json:"by_realm"`
+	ByAccount []KeyedAgg `json:"by_account"`
+	ByModel   []KeyedAgg `json:"by_model"`
+	// ByAPIKey 按 API 密钥名的用量聚合。密钥名不是机密，故直接明文落盘/透出。
+	ByAPIKey []KeyedAgg `json:"by_api_key"`
+	// KeyOptions 时间窗内出现过的密钥名，**不受 Window.Key 筛选影响**，供面板
+	// 下拉框作为选项来源。已排序，保证刷新时下拉顺序稳定（不排序的话每次
+	// map 遍历顺序都在变，选项会乱跳）。
+	KeyOptions      []string    `json:"key_options"`
 	Series          []Point     `json:"series"`
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	// CreditByAPIKey 按 API 密钥名的积分扣除聚合。
+	CreditByAPIKey []CreditAgg `json:"credit_by_api_key"`
+	Buckets        int         `json:"buckets"`
+	FileBytes      int64       `json:"file_bytes"`
+	Since          string      `json:"since,omitempty"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
@@ -496,6 +586,12 @@ type Window struct {
 	Hours int
 	From  time.Time
 	To    time.Time
+	// Key 按 API 密钥名筛选（"" = 全部）。
+	//
+	// 筛选只收窄**统计口径**，不参与 KeyOptions 的收集——否则选中一把密钥之后，
+	// 下拉框的候选项就只剩它自己，用户再也切不回别的密钥。选项必须始终是
+	// 窗口内的全集。
+	Key string
 }
 
 // bounds 解析出实际生效的 [from, to]；零值表示该侧不设界。
@@ -572,8 +668,11 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	modelAgg := map[string]*aggAcc{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
+	keyAgg := map[string]*aggAcc{}
+	keyOptions := map[string]bool{}
 	creditAcctAgg := map[string]*creditAcc{}
 	creditModelAgg := map[string]*creditAcc{}
+	creditKeyAgg := map[string]*creditAcc{}
 	rateCache := map[string]string{}
 
 	// 数据起点（全库最早分片）：不受窗口影响，表示"记录自何时开始"。scope 字典序
@@ -598,6 +697,16 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 				continue
 			}
 		}
+		// 选项在密钥筛选**之前**收集（见 Window.Key 的说明）。
+		if b.Key != "" {
+			keyOptions[b.Key] = true
+		}
+		// 密钥筛选只收窄统计口径：totals / series / 各维度 / 积分全部跟随，
+		// 因此下拉框选哪把密钥，整页数字就是那把密钥的口径，不会出现
+		// "总览说 100 token、趋势图却是全站曲线"这种自相矛盾的画面。
+		if w.Key != "" && b.Key != w.Key {
+			continue
+		}
 		matched++
 		total.add(b)
 
@@ -615,6 +724,11 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		if acctRealm[b.UID] == "" {
 			acctRealm[b.UID] = b.Realm
 		}
+
+		if keyAgg[b.Key] == nil {
+			keyAgg[b.Key] = &aggAcc{}
+		}
+		keyAgg[b.Key].add(b)
 
 		if modelAgg[b.Model] == nil {
 			modelAgg[b.Model] = &aggAcc{}
@@ -646,6 +760,13 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			}
 			ca.add(b)
 
+			ck := creditKeyAgg[b.Key]
+			if ck == nil {
+				ck = &creditAcc{CreditAgg: CreditAgg{Key: b.Key}}
+				creditKeyAgg[b.Key] = ck
+			}
+			ck.add(b)
+
 			model := canonicalUsageModel(b.Model)
 			rate := b.Rate
 			if rate == "" && currentRate != nil {
@@ -676,8 +797,11 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			return k, nicks[k]
 		}),
 		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByAPIKey:        keyed(keyAgg, func(k string) (string, string) { return k, "" }),
+		KeyOptions:      sortedKeys(keyOptions),
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
+		CreditByAPIKey:  creditKeyed(creditKeyAgg),
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
 	}

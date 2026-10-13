@@ -4,7 +4,8 @@
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
-//   - 鉴权复用网关 api_key（Bearer），与 /v1/* 同一口径；api_key 为空 = 不鉴权
+//   - 鉴权复用网关**密钥表**（Bearer，任一启用密钥均可），与 /v1/* 同一口径；
+//     生效表中无启用密钥 = 不鉴权
 //     （仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给 /panel/api/*；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
 //     添加账号走 auth.SaveAtomic + pool.Add，重启后与 auths/ 目录天然对齐。
@@ -37,7 +38,8 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
+	APIKey    string               // 静态单键回退（兼容既有 fixture）；空 = 不鉴权
+	APIKeys   []httpauth.APIKey    // 静态密钥表；与 Live 同时给出时 Live 优先
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
 
@@ -200,7 +202,7 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		if _, ok := httpauth.VerifyAnyBearer(r, p.apiKeys()); !ok {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
@@ -208,12 +210,32 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// apiKey 当前生效密钥（Live 优先，回落静态字段）。
-func (p *Panel) apiKey() string {
+// apiKeys 当前生效密钥表（Live 优先，回落静态字段）。
+//
+// 回落路径同时看 APIKeys 与旧的单键 APIKey，保证测试里只设 APIKey 的 fixture
+// 仍然可用——兼容优先于整洁，这里不值得为删除一个字段去改十处测试。
+func (p *Panel) apiKeys() []httpauth.APIKey {
 	if p.cfg.Live != nil {
-		return p.cfg.Live.Load().APIKey
+		return p.liveKeys(p.cfg.Live.Load().APIKeys)
 	}
-	return p.cfg.APIKey
+	return p.staticKeys()
+}
+
+func (p *Panel) liveKeys(ks []livecfg.APIKey) []httpauth.APIKey {
+	out := make([]httpauth.APIKey, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, httpauth.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+	}
+	return out
+}
+
+func (p *Panel) staticKeys() []httpauth.APIKey {
+	out := make([]httpauth.APIKey, 0, len(p.cfg.APIKeys)+1)
+	out = append(out, p.cfg.APIKeys...)
+	if p.cfg.APIKey != "" {
+		out = append(out, httpauth.APIKey{Name: "默认", Key: p.cfg.APIKey, Enabled: true})
+	}
+	return out
 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
@@ -240,7 +262,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
+		"auth_required":   httpauth.HasEnabled(p.apiKeys()),
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
 		"total":           total,
@@ -271,7 +293,8 @@ func (p *Panel) requestMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // requestLogs 从 JSONL 归档读取最近请求；limit 默认 200、最大 1000。
-// 支持按 outcome/account/model/client_ip/user_agent 过滤（字符串字段为包含匹配）
+// 支持按 outcome/account/model/client_ip/user_agent/api_key 过滤（字符串字段为包含匹配，
+// api_key_name 为精确匹配）
 // 与 from/to 时间区间（闭区间，unix 秒或 RFC3339）——面板「运行日志」的筛选框、
 // 来源查询与「今天 / 自定义区间」都走这里。
 func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
@@ -290,13 +313,15 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
-		Outcome:   q.Get("outcome"),
-		Account:   q.Get("account"),
-		Model:     q.Get("model"),
-		ClientIP:  q.Get("client_ip"),
-		UserAgent: q.Get("user_agent"),
-		From:      parseTimeParam(q.Get("from")),
-		To:        parseTimeParam(q.Get("to")),
+		Outcome:    q.Get("outcome"),
+		Account:    q.Get("account"),
+		Model:      q.Get("model"),
+		ClientIP:   q.Get("client_ip"),
+		UserAgent:  q.Get("user_agent"),
+		APIKey:     q.Get("api_key"),
+		APIKeyName: q.Get("api_key_name"),
+		From:       parseTimeParam(q.Get("from")),
+		To:         parseTimeParam(q.Get("to")),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -741,6 +766,9 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 			win.Hours = 1440
 		}
 	}
+	// 密钥筛选（空 = 全部）。按**名称**筛，与 usage 的维度键一致：名称不是机密，
+	// 可以出现在 URL 里；密钥值不行。
+	win.Key = strings.TrimSpace(q.Get("key"))
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
 	nicks := map[string]string{}
 	for _, s := range p.cfg.Pool.List() {
