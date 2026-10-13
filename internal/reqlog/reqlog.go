@@ -84,7 +84,7 @@ type Event struct {
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
 	ClientIP        string `json:"client_ip,omitempty"`
 	UserAgent       string `json:"user_agent,omitempty"`
-	// APIKey 是**掩码值**（logfmt.MaskKey：前 3 + 后 3 + 中间 *），供面板展示与
+	// APIKey 是**掩码值**（logfmt.MaskKey：前 3 + 固定 4 个 * + 后 3 位），供面板展示与
 	// 人工辨认"是哪一把密钥"。刻意不落明文——归档文件会被备份、传输、贴工单，
 	// 明文密钥留在里面等于把凭证散落在各处，与本包的脱敏约定冲突。
 	APIKey string `json:"api_key,omitempty"`

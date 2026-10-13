@@ -45,7 +45,7 @@ func TestArchivePersistsMaskedKeyAndName(t *testing.T) {
 	defer r.Close()
 
 	const fullKey = "sk-prod-abcdef123456"
-	masked := "sk-************456" // 与 logfmt.MaskKey 同形
+	masked := "sk-****456" // 与 logfmt.MaskKey 同形（前 3 + 固定 4 星 + 后 3）
 
 	r.Record(Event{
 		Time: time.Now(), RequestID: "a", Model: "glm-5.3",
