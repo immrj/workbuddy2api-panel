@@ -45,3 +45,10 @@ docs/
 *.zip
 server.exe
 .DS_Store
+.omx*
+/.omx/*
+/.omx-state-locks/*
+
+# 本地 UI 验证产物（playwright 截图/快照）
+output/playwright/
+.playwright-cli/
