@@ -30,7 +30,8 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # github.repository 自动小写化，得到 ghcr.io/linguo2625469/workbuddy2api-panel
+  # github.repository 自动小写化。本仓库（immrj）得到 ghcr.io/immrj/workbuddy2api-panel；
+  # fork 后无需改动此处——它跟随实际运行 workflow 的仓库。
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
