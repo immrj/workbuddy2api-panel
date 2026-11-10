@@ -680,6 +680,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sessKey := session.ExtractKey(body)
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
+		previousUID := h.cfg.Session.BoundUID(sessKey)
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		resolve := h.cfg.Session.ResolveForModel
@@ -688,6 +689,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if uid, ok := resolve(sessKey, peek.Model); ok {
 			stickyUID = uid
+		}
+		if previousUID != "" && previousUID != stickyUID {
+			st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(previousUID, ""), Reason: "sticky_unavailable"})
 		}
 	}
 
@@ -874,6 +878,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
 			// 的账号，下一轮不该被 realm 校验立刻解绑）。
 			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
+				st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(stickyUID, ""), Reason: "sticky_unavailable"})
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
@@ -920,6 +925,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
+			st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "in_flight_full"})
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
@@ -936,6 +942,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+				st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "refresh_failed"})
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -986,6 +993,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
+			st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "network_error"})
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
@@ -1015,6 +1023,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
+				st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "prompt_retry"})
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
@@ -1110,6 +1119,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+			reason := "upstream_error"
+			switch kind {
+			case upstream.ErrSoftRate:
+				reason = "rate_limit"
+			case upstream.ErrHardCredit:
+				reason = "credits_exhausted"
+			case upstream.ErrSessionDead:
+				reason = "session_expired"
+			case upstream.ErrWafBlock:
+				reason = "waf_block"
+			}
+			st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: reason})
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
@@ -1163,6 +1184,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 在流开始前就做了，于是一个正在限流的号被当成健康号，粘性还会把
 				// 整个会话钉在它身上，后续每轮都失败。
 				kind := upstream.FrameKind(errFrame)
+				if kind == upstream.ErrSoftRate {
+					st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "stream_rate_limit"})
+				}
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError

@@ -313,6 +313,12 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
+	const probeInterval = 30 * time.Second
+	for key, at := range p.fallbackProbe {
+		if now.Sub(at) >= 2*probeInterval {
+			delete(p.fallbackProbe, key)
+		}
+	}
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -333,6 +339,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if p.inFlightFull(e) {
 			continue
 		}
+		// 探测进行中时不再对该账号发起提前探测；即使常规并发上限未满也如此。
+		if e.inFlight.Load() > 0 {
+			continue
+		}
+		key := uid + "\x00" + model
+		if at, ok := p.fallbackProbe[key]; ok && now.Sub(at) < probeInterval {
+			continue
+		}
 		exp := e.expiry(now)
 		if exp.IsZero() {
 			continue
@@ -344,6 +358,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
+	p.fallbackProbe[best.a.UID+"\x00"+model] = now
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）

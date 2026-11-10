@@ -55,6 +55,7 @@ type chatStat struct {
 	requestID        string
 	outcome          string
 	attempts         int
+	routing          []reqlog.RouteEvent
 	credit           float64
 	hasCredit        bool
 	promptTokens     int64
@@ -475,6 +476,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.Outcome = s.outcome
 		e.TTFBMs = s.ttfb.Milliseconds()
 		e.Attempts = s.attempts
+		e.Routing = s.routing
 		e.PromptTokens = s.promptTokens
 		e.CompletionTokens = s.completionTokens
 		e.TotalTokens = s.totalTokens

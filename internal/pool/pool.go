@@ -35,6 +35,8 @@ type Pool struct {
 	// (域, 模型) 多至 1 次即时重探；已毕业号经 ModelCosts 恢复 tier，学费不重付。
 	// 只在探索事件时写入（tier 1 枯竭期间停走，陈旧无害）；不做对称清理。
 	exploreLast map[string]time.Time
+	// fallbackProbe 限制冷却兜底提前探测；仅在池锁内访问，不持久化。
+	fallbackProbe map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
@@ -108,6 +110,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		fallbackProbe:       map[string]time.Time{},
 	}
 	if stateFp != "" {
 		p.load()

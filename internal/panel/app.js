@@ -1035,6 +1035,14 @@ function reqKeyCell(e) {
   return '<span class="clip">' + esc(t) + '</span>';
 }
 
+function reqRoutingText(e) {
+  const reasons = {sticky_unavailable: '粘性账号变化或不可用', in_flight_full: '并发名额已满', refresh_failed: '令牌刷新失败', network_error: '网络连接错误', prompt_retry: '提示词降级重试', rate_limit: '上游限流', stream_rate_limit: '流式响应限流（未重试）', credits_exhausted: '积分不足', session_expired: '会话失效', waf_block: '上游风控', upstream_error: '上游错误'};
+  const steps = Array.isArray(e && e.routing) ? e.routing : [];
+  const detail = steps.map(s => (s.account || '账号') + '：' + (reasons[s.reason] || s.reason || '未知原因')).join(' → ');
+  const count = Number(e && e.attempts || 0);
+  return (count ? '上游尝试 ' + count + ' 次' : '尝试次数未记录') + (detail ? '；' + detail : '');
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -1051,6 +1059,7 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td><span class="clip" title="' + esc(reqRoutingText(e)) + '">' + esc(reqRoutingText(e)) + '</span></td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + reqKeyCell(e) + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1059,7 +1068,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">' +
+  }).join('') || '<tr><td colspan="12" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;

@@ -137,6 +137,17 @@ func (r *Router) Resolve(key string) (string, bool) {
 	return r.ResolveForModel(key, "")
 }
 
+// BoundUID reads the current unexpired binding without changing it.
+func (r *Router) BoundUID(key string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[key]
+	if !ok || expired(e, time.Now(), r.cfg.TTL) {
+		return ""
+	}
+	return e.uid
+}
+
 // LookupForModel 只复用已有有效绑定，不通过哈希为新会话分配账号。
 // 有序账号池策略用它保留粘性，未绑定会话由 Pool 选号并在成功后 Bind。
 func (r *Router) LookupForModel(key, model string) (string, bool) {

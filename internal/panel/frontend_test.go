@@ -36,6 +36,25 @@ func TestAppJSSyntax(t *testing.T) {
 	}
 }
 
+func TestRequestRoutingText(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := `const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync('app.js', 'utf8');
+const start = src.indexOf('function reqRoutingText('), end = src.indexOf('/* renderRequestTable', start);
+if (start < 0 || end < 0) throw Error('missing routing formatter');
+const ctx = {}; vm.createContext(ctx); vm.runInContext(src.slice(start, end), ctx);
+const actual = ctx.reqRoutingText({attempts: 2, routing: [{account:'a', reason:'rate_limit'}]});
+if (actual !== '上游尝试 2 次；a：上游限流') throw Error(actual);
+if (ctx.reqRoutingText({}) !== '尝试次数未记录') throw Error('old records');`
+	out, err := exec.Command(node, "-e", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("routing formatter: %v\n%s", err, out)
+	}
+}
+
 // TestIndexHTMLNoInlineScript index.html 不得含内联 <script> 块：
 // 严格 CSP（script-src 'self'）会拦截内联脚本，页面将完全不可用。
 // 外链形式 <script src="..."> 允许。
