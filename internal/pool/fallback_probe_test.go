@@ -51,3 +51,26 @@ func TestFallbackProbeThrottlesConcurrentAndRecovers(t *testing.T) {
 		t.Fatal("healthy account should be available")
 	}
 }
+
+func TestAbandonedFallbackReservation(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "probe"})
+	p.Cooldown("probe", CoolSoft, time.Minute, "test")
+	if acct, r := p.PickForRequest(nil, "m", ""); acct == nil {
+		t.Fatal("first probe not selected")
+	} else {
+		p.CancelProbe(r) // e.g. Acquire or token refresh failed before upstream call
+	}
+	acct, current := p.PickForRequest(nil, "m", "")
+	if acct == nil {
+		t.Fatal("abandoned probe must not block next attempt")
+	}
+	p.mu.Lock()
+	old := current
+	p.fallbackProbe[current.key] = current.at.Add(time.Second)
+	p.mu.Unlock()
+	p.CancelProbe(old)
+	if acct, _ := p.PickForRequest(nil, "m", ""); acct != nil {
+		t.Fatal("stale cancellation removed newer reservation")
+	}
+}

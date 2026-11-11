@@ -873,6 +873,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
+		var probe pool.ProbeReservation
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
@@ -896,11 +897,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
 				pickRealm = otherRealm(realm)
 			}
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
+			acct, probe = h.cfg.Pool.PickForRequest(tried, bareModel, pickRealm)
 			if acct == nil && crossRealm {
 				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
 				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
+				acct, probe = h.cfg.Pool.PickForRequest(tried, bareModel, otherRealm(pickRealm))
 			}
 		}
 		if acct == nil {
@@ -925,6 +926,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
+			h.cfg.Pool.CancelProbe(probe)
 			st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "in_flight_full"})
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
@@ -942,6 +944,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+				h.cfg.Pool.CancelProbe(probe)
 				st.routing = append(st.routing, reqlog.RouteEvent{Account: logfmt.Label(acct.UID, acct.Nickname), Reason: "refresh_failed"})
 				lastErr = err
 				var ue *upstream.Error

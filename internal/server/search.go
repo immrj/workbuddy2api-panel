@@ -61,7 +61,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	var lastKind upstream.ErrKind
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
+		acct, probe := h.cfg.Pool.PickForRequest(tried, "", "")
 		if acct == nil {
 			break
 		}
@@ -69,6 +69,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		// 在途租约：与 chat 共用同一名额池。搜索也是真实上游调用，不占名额会让
 		// 搜索流量绕过 MaxInFlight 限流。
 		if !h.cfg.Pool.Acquire(acct.UID) {
+			h.cfg.Pool.CancelProbe(probe)
 			if !rotateBackoff(i, ctx) {
 				break
 			}
@@ -78,6 +79,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		// 打到搜索端点会换回 401，被 applyErrorPolicy 当账号故障处置、误伤健康号。
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if rerr := h.cfg.Upstream.RefreshToken(acct); rerr != nil {
+				h.cfg.Pool.CancelProbe(probe)
 				h.cfg.Pool.Release(acct.UID)
 				lastErr = rerr
 				var ue *upstream.Error
