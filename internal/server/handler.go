@@ -214,6 +214,7 @@ type authenticatedAPIKey struct {
 	Name             string
 	Fingerprint      string
 	DailyCreditLimit float64
+	AllowedModels    map[string]struct{}
 }
 
 type authenticatedAPIKeyContextKey struct{}
@@ -246,6 +247,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			Name:             key.Name,
 			Fingerprint:      keyquota.Fingerprint(key.Key),
 			DailyCreditLimit: key.DailyCreditLimit,
+			AllowedModels:    livecfg.NormalizeAllowedModels(key.AllowedModels),
 		}
 		if key.Key != "" {
 			r = r.WithContext(context.WithValue(r.Context(), authenticatedAPIKeyContextKey{}, authKey))
@@ -255,6 +257,27 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// requestAllowedModels 返回当前请求所用 API Key 的模型白名单。
+// 没有启用鉴权、使用旧单键 api_key，或该 Key 未配置 allowed_models 时返回 nil，
+// 表示不额外限制。
+func requestAllowedModels(r *http.Request) map[string]struct{} {
+	key, ok := authenticatedAPIKeyFrom(r.Context())
+	if !ok {
+		return nil
+	}
+	return key.AllowedModels
+}
+
+// modelAllowedByScope 判断 (realm, bare model) 是否落在模型白名单内。
+// 空白名单 = 不限制；裸名在配置归一化时展开为 cn/global 两项。
+func modelAllowedByScope(scope map[string]struct{}, realm, model string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	_, ok := scope[realm+":"+model]
+	return ok
 }
 
 // allowChatByDailyLimit 对聊天入口执行轻量每日额度检查。
@@ -323,6 +346,7 @@ func (h *Handler) loadKeys() []httpauth.APIKey {
 				Key:              k.Key,
 				Enabled:          k.Enabled,
 				DailyCreditLimit: k.DailyCreditLimit,
+				AllowedModels:    append([]string(nil), k.AllowedModels...),
 			})
 		}
 		return out
@@ -344,6 +368,7 @@ func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
 			Key:              k.Key,
 			Enabled:          k.Enabled,
 			DailyCreditLimit: k.DailyCreditLimit,
+			AllowedModels:    append([]string(nil), k.AllowedModels...),
 		})
 	}
 	return out
@@ -460,7 +485,7 @@ const (
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   h.modelList(requestAllowedModels(r)),
 	})
 }
 
@@ -537,13 +562,17 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
-// 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
-func (h *Handler) modelList() []map[string]any {
+// 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。allowed 为当前 API Key
+// 的模型白名单（nil = 不限制），过滤只作用于本次响应，不回写全局目录缓存。
+func (h *Handler) modelList(allowed map[string]struct{}) []map[string]any {
 	out := make([]map[string]any, 0)
 	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
 	hidden := h.loadLive().HiddenModels
 	for _, mi := range h.fetchDynamicModels() {
 		if _, ok := hidden["cn:"+mi.ID]; ok {
+			continue
+		}
+		if !modelAllowedByScope(allowed, "cn", mi.ID) {
 			continue
 		}
 		entry := map[string]any{
@@ -590,6 +619,9 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			if _, ok := hidden["global:"+id]; ok {
+				continue
+			}
+			if !modelAllowedByScope(allowed, "global", id) {
 				continue
 			}
 			entry := map[string]any{
@@ -732,6 +764,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
+	allowedModels := requestAllowedModels(r)
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -741,6 +774,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
 	// 显式 cn:/global: 前缀保持原语义，永不回退。
 	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	// 白名单只允许一个域时，裸名跨域回退会把请求送到未授权域。
+	// 先收紧回退开关，再在下方做统一的白名单校验。
+	if crossRealm && !modelAllowedByScope(allowedModels, otherRealm(realm), bareModel) {
+		crossRealm = false
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -758,6 +796,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
+	// API Key 模型白名单：与 /v1/models 的列表过滤同一口径。放在选号/粘性之前，
+	// 无权限的模型不消耗账号、不进入上游，也不污染模型锁。
+	if !modelAllowedByScope(allowedModels, realm, bareModel) {
+		writeOpenAIErrorHint(w, http.StatusForbidden, "model_not_allowed",
+			"model is not allowed for this API key, choose one from /v1/models", "")
+		st.status = http.StatusForbidden
 		st.outcome = reqlog.OutcomeHTTPError
 		return
 	}

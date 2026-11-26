@@ -9,18 +9,23 @@ import "testing"
 // 或就地改元素，就会在每个并发请求读快照时与之数据竞争——这类竞争通常不立刻
 // 崩，只会让密钥偶尔"变成别人的"，极难排查。
 func TestLoadCopiesSlice(t *testing.T) {
-	h := New(Snapshot{APIKeys: []APIKey{{Name: "prod", Key: "k1", Enabled: true, DailyCreditLimit: 25}}})
+	h := New(Snapshot{APIKeys: []APIKey{{
+		Name: "prod", Key: "k1", Enabled: true, DailyCreditLimit: 25,
+		AllowedModels: []string{"cn:glm-5.2"},
+	}}})
 
 	got := h.Load()
-	if len(got.APIKeys) != 1 || got.APIKeys[0].Name != "prod" || got.APIKeys[0].DailyCreditLimit != 25 {
+	if len(got.APIKeys) != 1 || got.APIKeys[0].Name != "prod" || got.APIKeys[0].DailyCreditLimit != 25 ||
+		len(got.APIKeys[0].AllowedModels) != 1 || got.APIKeys[0].AllowedModels[0] != "cn:glm-5.2" {
 		t.Fatalf("Load 应返回原值，实际 %+v", got.APIKeys)
 	}
 
 	got.APIKeys[0].Name = "tampered"
+	got.APIKeys[0].AllowedModels[0] = "tampered"
 
 	again := h.Load()
-	if again.APIKeys[0].Name != "prod" {
-		t.Fatalf("读者侧改动泄漏到了 Holder：%q", again.APIKeys[0].Name)
+	if again.APIKeys[0].Name != "prod" || again.APIKeys[0].AllowedModels[0] != "cn:glm-5.2" {
+		t.Fatalf("读者侧改动泄漏到了 Holder：%+v", again.APIKeys[0])
 	}
 }
 
@@ -90,5 +95,22 @@ func TestNormalizeHiddenModels(t *testing.T) {
 		if _, ok := got[want]; !ok {
 			t.Errorf("odd prefix: missing %q in %v", want, got)
 		}
+	}
+}
+
+// TestNormalizeAllowedModels 与 hidden 共用归一化口径：裸名展开两域，
+// 前缀精确到域，非法前缀视为裸名整体。
+func TestNormalizeAllowedModels(t *testing.T) {
+	if got := NormalizeAllowedModels(nil); got != nil {
+		t.Errorf("nil → %v, want nil", got)
+	}
+	got := NormalizeAllowedModels([]string{"glm-5.2", "cn:deepseek-v3"})
+	for _, want := range []string{"cn:glm-5.2", "global:glm-5.2", "cn:deepseek-v3"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+	if _, ok := got["global:deepseek-v3"]; ok {
+		t.Errorf("cn: entry must not allow global:deepseek-v3")
 	}
 }

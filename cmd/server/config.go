@@ -30,10 +30,32 @@ type APIKeyEntry struct {
 	Enabled *bool  `json:"enabled,omitempty"`
 	// DailyCreditLimit 每日已结算积分上限；0 = 不限。
 	DailyCreditLimit float64 `json:"daily_credit_limit,omitempty"`
+	// AllowedModels 该密钥可调用的模型白名单。空 = 不额外限制；
+	// 裸名 = 两域都允许；"cn:xxx"/"global:xxx" = 只允许该域。
+	AllowedModels []string `json:"allowed_models,omitempty"`
 }
 
 // enabled 归一：nil 视为启用。
 func (e APIKeyEntry) enabled() bool { return e.Enabled == nil || *e.Enabled }
+
+// cleanModelIDs 裁剪空白、去重并丢弃空项。配置校验会拒绝显式的空项；
+// 这里再做一次防御，保证 EffectiveAPIKeys 的直接调用方（测试）也拿到干净数据。
+func cleanModelIDs(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
 
 // DefaultKeyName 兜底密钥名。用于旧 api_key 单值、以及历史 usage 桶的迁移归属。
 const DefaultKeyName = "默认"
@@ -71,6 +93,7 @@ func effectiveAPIKeys(entries []APIKeyEntry, legacy string) []httpauth.APIKey {
 			Key:              key,
 			Enabled:          e.enabled(),
 			DailyCreditLimit: e.DailyCreditLimit,
+			AllowedModels:    cleanModelIDs(e.AllowedModels),
 		})
 		seen[key] = true
 	}
@@ -773,6 +796,11 @@ func (c *Config) normalizeAPIKeys() error {
 		}
 		if e.DailyCreditLimit < 0 || math.IsNaN(e.DailyCreditLimit) || math.IsInf(e.DailyCreditLimit, 0) {
 			return fmt.Errorf("api_keys[%d] (name=%q): daily_credit_limit 必须是非负数（0 = 不限）", i, e.Name)
+		}
+		for j, m := range e.AllowedModels {
+			if strings.TrimSpace(m) == "" {
+				return fmt.Errorf("api_keys[%d] (name=%q): allowed_models[%d] 不能为空；不限制请省略字段或传空数组", i, e.Name, j)
+			}
 		}
 		if keys[k] {
 			return fmt.Errorf("api_keys[%d] (name=%q): key 值重复，同一个密钥不能登记两次", i, e.Name)

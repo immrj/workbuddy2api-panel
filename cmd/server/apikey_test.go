@@ -115,12 +115,58 @@ func TestNormalizeRejectsNegativeDailyCreditLimit(t *testing.T) {
 	}
 }
 
+// TestEffectiveAPIKeysAllowedModels 模型白名单必须随生效密钥表进入运行时；
+// 空白项在投影时裁剪去重，旧单键 api_key 保持不限制。
+func TestEffectiveAPIKeysAllowedModels(t *testing.T) {
+	c := mustParse(t, `{"api_key":"sk-legacy","api_keys":[
+	  {"name":"prod","key":"k1","allowed_models":[" cn:glm-5.2 ","cn:glm-5.2","global:gpt-5.6-sol"]}
+	]}`)
+	ks := c.EffectiveAPIKeys()
+	if len(ks) != 2 {
+		t.Fatalf("want 2 keys, got %+v", ks)
+	}
+	got := ks[0].AllowedModels
+	if len(got) != 2 || got[0] != "cn:glm-5.2" || got[1] != "global:gpt-5.6-sol" {
+		t.Fatalf("allowed models=%v want trimmed/deduped [cn:glm-5.2 global:gpt-5.6-sol]", got)
+	}
+	if len(ks[1].AllowedModels) != 0 {
+		t.Fatalf("legacy key must stay unrestricted, got %v", ks[1].AllowedModels)
+	}
+}
+
+// TestNormalizeRejectsBlankAllowedModel 空模型 ID 会意外把白名单变成"全部"，
+// 配置保存阶段必须硬拒绝而不是静默丢弃。
+func TestNormalizeRejectsBlankAllowedModel(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"api_keys":[{"name":"prod","key":"k1","allowed_models":["cn:glm-5.2"," "]}]}`))
+	if err == nil {
+		t.Fatal("blank allowed_models entry should be rejected")
+	}
+	if !strings.Contains(err.Error(), "allowed_models") {
+		t.Fatalf("error should name allowed_models, got %v", err)
+	}
+}
+
 func TestToLiveKeysCopiesDailyCreditLimit(t *testing.T) {
 	got := toLiveKeys([]httpauth.APIKey{{
 		Name: "prod", Key: "sk-prod", Enabled: true, DailyCreditLimit: 8.5,
 	}})
 	if len(got) != 1 || got[0].DailyCreditLimit != 8.5 {
 		t.Fatalf("toLiveKeys dropped daily limit: %+v", got)
+	}
+}
+
+func TestToLiveKeysCopiesAllowedModels(t *testing.T) {
+	in := []httpauth.APIKey{{
+		Name: "prod", Key: "sk-prod", Enabled: true,
+		AllowedModels: []string{"cn:glm-5.2"},
+	}}
+	got := toLiveKeys(in)
+	if len(got) != 1 || len(got[0].AllowedModels) != 1 || got[0].AllowedModels[0] != "cn:glm-5.2" {
+		t.Fatalf("toLiveKeys dropped allowed models: %+v", got)
+	}
+	in[0].AllowedModels[0] = "mutated"
+	if got[0].AllowedModels[0] != "cn:glm-5.2" {
+		t.Fatalf("toLiveKeys shared allowed_models backing array: %+v", got)
 	}
 }
 

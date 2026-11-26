@@ -53,6 +53,9 @@ type APIKey struct {
 	// DailyCreditLimit 为该密钥每个本地自然日可结算的积分上限。
 	// 0 = 不限；负值由配置层拒绝。
 	DailyCreditLimit float64 `json:"daily_credit_limit,omitempty"`
+	// AllowedModels 该密钥可调用的模型白名单。空 = 不额外限制；
+	// 裸名 = 两域都允许；"cn:xxx"/"global:xxx" = 只允许该域。
+	AllowedModels []string `json:"allowed_models,omitempty"`
 }
 
 // VerifyAnyBearer 在候选密钥表中校验 Bearer，返回命中的那一条。

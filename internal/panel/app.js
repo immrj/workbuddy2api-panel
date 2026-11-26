@@ -1386,6 +1386,7 @@ function put(obj, path, val) {
 }
 
 async function loadConfig() {
+  closeKeyModelPicker();
   try {
     const d = await api('config');
     cfgLoaded = d.config;
@@ -1401,6 +1402,8 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     renderKeyList(cfgLoaded); // 密钥表不走 CFG_MAP，单独回填（见 CFG_MAP 上方注）
+    keyNewAllowedModels = [];
+    syncNewKeyModelButton();
     const pa = cfgLoaded.panel_auth || {};
     if ($('panelAuthPassword')) $('panelAuthPassword').value = '';
     if ($('panelAuthPassword2')) $('panelAuthPassword2').value = '';
@@ -1466,6 +1469,12 @@ $('cfgForm').addEventListener('input', ev => {
 let cfgKeyRows = [];      // 最近一次由后端回填/重绘的密钥；编辑期以 DOM 为准
 let keyShown = false;     // 密钥值明文/掩码开关
 let keyNotice = '';       // collectKeys 补默认值的说明，供保存后一次性提示
+let keyNewAllowedModels = []; // 「添加密钥」行当前选择的模型白名单
+let keyModelCatalog = null;   // 可用模型目录（首次打开下拉时懒加载，之后复用）
+let keyModelLoadPromise = null;
+let keyModelLoadError = '';
+let keyModelPick = null;      // { kind: 'row'|'new', index, btn }
+let keyModelQuery = '';
 
 /* genKeyValue 生成一把建议密钥值。空 key 是后端硬错误（normalizeAPIKeys 直接
    拒绝整次保存），所以"留空自动生成"必须在前端补齐，而不是让用户点一次保存、
@@ -1484,6 +1493,226 @@ function genKeyValue() {
   }
 }
 
+/* ── API Key 模型白名单多选 ───────────────────────────────────────────
+   allowed_models 为空 = 不限制；非空 = 仅允许列表内模型。裸名由后端展开为
+   两域都允许，面板这里保留用户选中的原始 id（目录里通常是 cn:/global: 前缀）。 */
+function normalizeModelIDs(list) {
+  const out = [], seen = new Set();
+  for (const raw of (Array.isArray(list) ? list : [])) {
+    const id = String(raw == null ? '' : raw).trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function modelScopeLabel(list) {
+  const ids = normalizeModelIDs(list);
+  return ids.length ? ids.length + ' 个模型' : '全部模型';
+}
+
+function modelScopeTitle(list) {
+  const ids = normalizeModelIDs(list);
+  return ids.length ? '仅允许：\n' + ids.join('\n') : '不限制：允许全部模型（含以后新增）';
+}
+
+function paintModelPickerButton(btn, list) {
+  if (!btn) return;
+  const ids = normalizeModelIDs(list);
+  btn.textContent = modelScopeLabel(ids);
+  btn.title = modelScopeTitle(ids);
+  btn.dataset.models = JSON.stringify(ids);
+}
+
+function modelPickerHtml(list, attrs) {
+  const ids = normalizeModelIDs(list);
+  return '<button type="button" class="ms-btn k-models xs" ' + (attrs || '') +
+    ' data-models="' + esc(JSON.stringify(ids)) + '" title="' + esc(modelScopeTitle(ids)) +
+    '" aria-haspopup="dialog" aria-expanded="false">' + esc(modelScopeLabel(ids)) + '</button>';
+}
+
+function syncNewKeyModelButton() {
+  paintModelPickerButton($('keyNewModels'), keyNewAllowedModels);
+}
+
+function keyModelPickModels() {
+  if (!keyModelPick) return [];
+  if (keyModelPick.kind === 'new') return keyNewAllowedModels.slice();
+  const row = cfgKeyRows[keyModelPick.index];
+  return row ? normalizeModelIDs(row.allowed_models) : [];
+}
+
+function setKeyModelPickModels(list) {
+  if (!keyModelPick) return;
+  const ids = normalizeModelIDs(list);
+  if (keyModelPick.kind === 'new') {
+    keyNewAllowedModels = ids;
+    syncNewKeyModelButton();
+  } else {
+    const row = cfgKeyRows[keyModelPick.index];
+    if (!row) return;
+    row.allowed_models = ids;
+    paintModelPickerButton(keyModelPick.btn, ids);
+  }
+  renderKeyModelMenu();
+}
+
+function toggleKeyModel(id) {
+  const cur = keyModelPickModels();
+  const next = cur.includes(id) ? cur.filter(x => x !== id) : cur.concat([id]);
+  setKeyModelPickModels(next);
+}
+
+function keyModelCatalogItems() {
+  const byID = new Map();
+  for (const m of (keyModelCatalog || [])) {
+    if (m && m.id) byID.set(String(m.id), { id: String(m.id), name: String(m.name || '') });
+  }
+  for (const m of (mdAll || [])) {
+    if (m && m.id && !byID.has(String(m.id))) {
+      byID.set(String(m.id), { id: String(m.id), name: String(m.name || '') });
+    }
+  }
+  for (const id of keyModelPickModels()) {
+    if (!byID.has(id)) byID.set(id, { id, name: '' });
+  }
+  return Array.from(byID.values());
+}
+
+function modelGroupOf(id) {
+  const i = id.indexOf(':');
+  if (i > 0) {
+    const p = id.slice(0, i);
+    if (p === 'cn' || p === 'global') return p;
+  }
+  return 'other';
+}
+
+function renderKeyModelMenu() {
+  const listEl = $('keyModelList');
+  if (!listEl || !keyModelPick) return;
+  const selected = new Set(keyModelPickModels());
+  const all = selected.size === 0;
+  const q = keyModelQuery.trim().toLowerCase();
+  const items = keyModelCatalogItems().filter(m =>
+    !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
+  const groups = { cn: [], global: [], other: [] };
+  for (const m of items) groups[modelGroupOf(m.id)].push(m);
+  for (const key of Object.keys(groups)) {
+    groups[key].sort((a, b) => a.id.localeCompare(b.id));
+  }
+  const allHtml =
+    '<label class="ms-opt ms-all"><input type="checkbox" data-ms-all' + (all ? ' checked' : '') +
+    '><span><b>不限制</b><em>允许全部模型，包括以后新增</em></span></label>';
+  const groupMeta = [['cn', '国内版 CN'], ['global', '国际版 Global'], ['other', '其他 / 手动输入']];
+  let body = '';
+  for (const [key, label] of groupMeta) {
+    const rows = groups[key];
+    if (!rows.length) continue;
+    body += '<div class="ms-group"><div class="ms-group-label">' + esc(label) + '</div>' +
+      rows.map(m => {
+        const checked = selected.has(m.id);
+        return '<label class="ms-opt"><input type="checkbox" data-ms-id="' + esc(m.id) + '"' +
+          (checked ? ' checked' : '') + '><span><code>' + esc(m.id) + '</code>' +
+          (m.name ? '<em>' + esc(m.name) + '</em>' : '') + '</span></label>';
+      }).join('') + '</div>';
+  }
+  if (!body) {
+    body = '<div class="ms-empty">' +
+      (keyModelLoadPromise ? '正在加载模型目录…' :
+        (keyModelLoadError ? '模型目录读取失败，可在下方手动添加。' : '目录中没有匹配的模型，可在下方手动添加。')) +
+      '</div>';
+  }
+  const scrollTop = listEl.scrollTop || 0;
+  listEl.innerHTML = allHtml + body;
+  listEl.scrollTop = scrollTop;
+  const note = $('keyModelNote');
+  if (note) note.textContent = all ? '不限制' : '已选 ' + selected.size + ' 个模型';
+}
+
+function positionKeyModelMenu(btn) {
+  const menu = $('keyModelMenu');
+  if (!menu || !btn) return;
+  const r = btn.getBoundingClientRect();
+  const gap = 6, vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+  const width = Math.min(380, Math.max(260, vw - 16));
+  menu.style.width = width + 'px';
+  menu.hidden = false;
+  const mh = Math.min(menu.offsetHeight || 420, vh - 16);
+  let left = Math.min(r.left, vw - width - 8);
+  if (left < 8) left = 8;
+  let top = r.bottom + gap;
+  if (top + mh > vh - 8) top = Math.max(8, r.top - mh - gap);
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+}
+
+function closeKeyModelPicker() {
+  const menu = $('keyModelMenu');
+  if (keyModelPick && keyModelPick.btn) keyModelPick.btn.setAttribute('aria-expanded', 'false');
+  if (menu) menu.hidden = true;
+  keyModelPick = null;
+}
+
+function openKeyModelPicker(kind, index, btn) {
+  if (keyModelPick && keyModelPick.btn !== btn) closeKeyModelPicker();
+  keyModelPick = { kind, index, btn };
+  keyModelQuery = '';
+  const search = $('keyModelSearch');
+  if (search) search.value = '';
+  const manual = $('keyModelManual');
+  if (manual) manual.value = '';
+  btn.setAttribute('aria-expanded', 'true');
+  const loading = keyModelCatalog ? null : loadKeyModelCatalog();
+  renderKeyModelMenu();
+  positionKeyModelMenu(btn);
+  if (loading) {
+    loading.then(() => {
+      if (keyModelPick && keyModelPick.btn === btn) {
+        renderKeyModelMenu();
+        positionKeyModelMenu(btn);
+      }
+    }).catch(() => {
+      if (keyModelPick && keyModelPick.btn === btn) {
+        renderKeyModelMenu();
+        positionKeyModelMenu(btn);
+      }
+    });
+  }
+  setTimeout(() => {
+    if (search && keyModelPick && keyModelPick.btn === btn) search.focus();
+  }, 30);
+}
+
+function loadKeyModelCatalog() {
+  if (keyModelCatalog) return Promise.resolve(keyModelCatalog);
+  if (mdAll.length) {
+    keyModelCatalog = mdAll.map(m => ({ id: m.id, name: m.name || '' }));
+    return Promise.resolve(keyModelCatalog);
+  }
+  if (keyModelLoadPromise) return keyModelLoadPromise;
+  keyModelLoadError = '';
+  keyModelLoadPromise = api('models').then(d => {
+    keyModelCatalog = (d.models || []).map(m => ({ id: m.id, name: m.name || '' }));
+    return keyModelCatalog;
+  }).catch(e => {
+    keyModelLoadError = e.message || String(e);
+    throw e;
+  }).finally(() => { keyModelLoadPromise = null; });
+  return keyModelLoadPromise;
+}
+
+function addManualKeyModel() {
+  const el = $('keyModelManual');
+  if (!el) return;
+  const id = el.value.trim();
+  if (!id) return;
+  const cur = keyModelPickModels();
+  if (!cur.includes(id)) setKeyModelPickModels(cur.concat([id]));
+  el.value = '';
+}
+
 /* paintKeyRows 整表重绘。行内输入直接用 value 属性落值（esc 覆盖引号），事件走
    容器委托，因此换掉子节点不会丢监听。 */
 function paintKeyRows() {
@@ -1495,13 +1724,14 @@ function paintKeyRows() {
     '<tr>' +
       '<td>' + inp('k-name', 'text', k.name, '第 ' + (i + 1) + ' 行密钥名称') + '</td>' +
       '<td>' + inp('k-val', keyShown ? 'text' : 'password', k.key, '第 ' + (i + 1) + ' 行密钥值') + '</td>' +
+      '<td class="k-models-cell">' + modelPickerHtml(k.allowed_models, 'data-key-models="' + i + '"') + '</td>' +
       '<td class="num">' + inp('k-limit', 'number', k.daily_credit_limit > 0 ? k.daily_credit_limit : '',
         '第 ' + (i + 1) + ' 行每日积分上限', ' min="0" step="any" placeholder="不限"') + '</td>' +
       '<td class="num"><input class="k-on" type="checkbox"' + (k.enabled ? ' checked' : '') +
         ' aria-label="启用第 ' + (i + 1) + ' 行密钥"></td>' +
       '<td class="c-acts"><button type="button" class="xs" data-kdel="' + i + '">删除</button></td>' +
     '</tr>'
-  ).join('') || '<tr><td colspan="5" class="empty">尚无密钥 —— 该状态下 /v1/* 与 /status 均不鉴权；面板登录状态取决于「面板登录」设置</td></tr>';
+  ).join('') || '<tr><td colspan="6" class="empty">尚无密钥 —— 该状态下 /v1/* 与 /status 均不鉴权；面板登录状态取决于「面板登录」设置</td></tr>';
 }
 
 /* renderKeyList 用后端配置回填密钥表。老配置只有单值 api_key：显示成一条
@@ -1516,6 +1746,7 @@ function renderKeyList(cfg) {
     name: String(k && k.name || ''),
     key: String(k && k.key || ''),
     enabled: !(k && k.enabled === false),
+    allowed_models: normalizeModelIDs(k && k.allowed_models),
     daily_credit_limit: (() => {
       const n = Number(k && k.daily_credit_limit);
       return Number.isFinite(n) && n > 0 ? n : 0;
@@ -1531,12 +1762,19 @@ function readRows() {
   const tb = $('cfgKeyList');
   if (!tb) return rows;
   tb.querySelectorAll('tr').forEach(tr => {
-    const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val'), l = tr.querySelector('.k-limit'), o = tr.querySelector('.k-on');
+    const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val'), l = tr.querySelector('.k-limit'),
+      o = tr.querySelector('.k-on'), mb = tr.querySelector('.k-models');
     if (!n || !v) return;   // 空态那一行没有输入框
     const rawLimit = l ? l.value.trim() : '';
+    const old = cfgKeyRows[rows.length];
+    let allowed_models = normalizeModelIDs(old && old.allowed_models);
+    if (mb && mb.dataset && mb.dataset.models) {
+      try { allowed_models = normalizeModelIDs(JSON.parse(mb.dataset.models)); } catch (e) { /* keep old */ }
+    }
     rows.push({
       name: n.value.trim(),
       key: v.value.trim(),
+      allowed_models,
       daily_credit_limit: rawLimit === '' ? 0 : Number(rawLimit),
       enabled: !!(o && o.checked),
     });
@@ -1622,14 +1860,29 @@ $('btnKeyAdd').onclick = () => {
     toast('每日积分上限必须是非负数（留空或 0 = 不限）。', 'err');
     return;
   }
-  cfgKeyRows.push({ name, key: (valEl.value.trim() || genKeyValue()), daily_credit_limit: limit, enabled: true });
+  cfgKeyRows.push({
+    name,
+    key: (valEl.value.trim() || genKeyValue()),
+    allowed_models: keyNewAllowedModels.slice(),
+    daily_credit_limit: limit,
+    enabled: true,
+  });
   nameEl.value = ''; valEl.value = ''; if (limitEl) limitEl.value = '';
+  keyNewAllowedModels = [];
+  syncNewKeyModelButton();
   paintKeyRows();
 };
 $('keyNewVal').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKeyAdd').click(); });
+if ($('keyNewModels')) $('keyNewModels').onclick = () => openKeyModelPicker('new', -1, $('keyNewModels'));
 $('cfgKeyList').addEventListener('click', ev => {
+  const mb = ev.target.closest('button[data-key-models]');
+  if (mb) {
+    openKeyModelPicker('row', Number(mb.dataset.keyModels), mb);
+    return;
+  }
   const b = ev.target.closest('button[data-kdel]');
   if (!b) return;
+  closeKeyModelPicker();
   const i = Number(b.dataset.kdel);
   if (!cfgKeyRows[i]) return;
   cfgKeyRows = readRows();
@@ -1647,12 +1900,60 @@ $('cfgKeyList').addEventListener('click', ev => {
   paintKeyRows();
 });
 $('btnEye').onclick = () => {
+  closeKeyModelPicker();
   keyShown = !keyShown;
   cfgKeyRows = readRows();
   paintKeyRows();
   $('btnEye').textContent = keyShown ? '隐藏值' : '显示值';
 };
-$('btnCfgReload').onclick = loadConfig;
+if ($('keyModelSearch')) {
+  $('keyModelSearch').addEventListener('input', ev => {
+    keyModelQuery = ev.target.value;
+    renderKeyModelMenu();
+  });
+}
+if ($('keyModelList')) {
+  $('keyModelList').addEventListener('click', ev => {
+    if (ev.target.closest('[data-ms-all]')) {
+      setKeyModelPickModels([]);
+      return;
+    }
+    const opt = ev.target.closest('[data-ms-id]');
+    if (!opt) return;
+    toggleKeyModel(opt.dataset.msId);
+  });
+}
+if ($('btnKeyModelAdd')) {
+  $('btnKeyModelAdd').onclick = addManualKeyModel;
+}
+if ($('btnKeyModelAll')) {
+  $('btnKeyModelAll').onclick = () => setKeyModelPickModels([]);
+}
+if ($('keyModelManual')) {
+  $('keyModelManual').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); addManualKeyModel(); }
+  });
+}
+if ($('btnKeyModelClose')) $('btnKeyModelClose').onclick = closeKeyModelPicker;
+document.addEventListener('click', ev => {
+  if (!keyModelPick) return;
+  if (ev.target.closest && (ev.target.closest('#keyModelMenu') ||
+    ev.target.closest('[data-key-models]') || ev.target.closest('#keyNewModels'))) return;
+  closeKeyModelPicker();
+});
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && keyModelPick) closeKeyModelPicker();
+});
+addEventListener('resize', () => {
+  if (keyModelPick) positionKeyModelMenu(keyModelPick.btn);
+});
+addEventListener('scroll', ev => {
+  if (!keyModelPick) return;
+  const menu = $('keyModelMenu');
+  if (menu && menu.contains(ev.target)) return;
+  closeKeyModelPicker();
+}, true);
+$('btnCfgReload').onclick = () => { closeKeyModelPicker(); loadConfig(); };
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。

@@ -2,7 +2,7 @@
   "listen": ":7863",
   "api_key": "test_key",
   "api_keys": [
-    { "name": "example", "key": "replace-with-your-own-key", "enabled": false, "daily_credit_limit": 0 }
+    { "name": "example", "key": "replace-with-your-own-key", "enabled": false, "daily_credit_limit": 0, "allowed_models": [] }
   ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",

@@ -264,6 +264,7 @@ func (p *Panel) liveKeys(ks []livecfg.APIKey) []httpauth.APIKey {
 			Key:              k.Key,
 			Enabled:          k.Enabled,
 			DailyCreditLimit: k.DailyCreditLimit,
+			AllowedModels:    append([]string(nil), k.AllowedModels...),
 		})
 	}
 	return out

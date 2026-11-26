@@ -926,15 +926,23 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function genKeyValue');
 const end = src.indexOf("$('btnKeyAdd')");
 if (start < 0 || end < 0 || end < start) throw new Error('collectKeys region not found');
-const mkRow = (name, key, limit, on) => {
-  const els = { '.k-name': { value: name }, '.k-val': { value: key }, '.k-limit': { value: limit }, '.k-on': { checked: on } };
+const mkRow = (name, key, limit, on, models) => {
+  const els = {
+    '.k-name': { value: name }, '.k-val': { value: key }, '.k-limit': { value: limit }, '.k-on': { checked: on },
+    '.k-models': { dataset: { models: JSON.stringify(models || []) } },
+  };
   return { querySelector: sel => els[sel] || null, _els: els };
 };
-const rows = [mkRow('', '', '25', true), mkRow('prod', 'sk-live', '', true), mkRow('old', 'sk-old', '100', false)];
+const rows = [
+  mkRow('', '', '25', true, []),
+  mkRow('prod', 'sk-live', '', true, ['cn:glm-5.2']),
+  mkRow('old', 'sk-old', '100', false, ['global:gpt-5.6-sol']),
+];
 const tb = { querySelectorAll: () => rows };
 const ctx = {
+  cfgKeyRows: [],
   esc: s => String(s == null ? '' : s),
-  Math, Array, Object, String, Uint8Array,
+  Math, Array, Object, String, Set, Uint8Array,
   crypto: { getRandomValues: a => a },
   $: id => (id === 'cfgKeyList' ? tb : null),
 };
@@ -946,6 +954,7 @@ process.stdout.write(JSON.stringify({
   firstKeyGenerated: keys[0].key.indexOf('sk-') === 0 && keys[0].key.length > 10,
   kept: [keys[1].key, keys[1].enabled, keys[2].key, keys[2].enabled],
   limits: keys.map(k => k.daily_credit_limit),
+  models: keys.map(k => k.allowed_models),
   writtenBack: [rows[0]._els['.k-name'].value === keys[0].name, rows[0]._els['.k-val'].value === keys[0].key],
   dupBad: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }, { name: 'a', key: 'k3' }]) !== '',
   uniqOk: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }]) === '',
@@ -966,7 +975,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("collectKeys node test failed: %v\n%s", err, out)
 	}
 	const want = `{"names":["密钥1","prod","old"],"firstKeyGenerated":true,"kept":["sk-live",true,"sk-old",false],` +
-		`"limits":[25,0,100],"writtenBack":[true,true],"dupBad":true,"uniqOk":true,` +
+		`"limits":[25,0,100],"models":[[],["cn:glm-5.2"],["global:gpt-5.6-sol"]],"writtenBack":[true,true],"dupBad":true,"uniqOk":true,` +
 		`"emptyKeyBad":true,"emptyKeyMsg":true,"negativeLimitBad":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectKeys=%s want %s", strings.TrimSpace(string(out)), want)
@@ -981,23 +990,25 @@ func TestAppJSRenderKeyListDailyLimit(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function paintKeyRows');
+const start = src.indexOf('function normalizeModelIDs');
 const end = src.indexOf('function readRows');
 if (start < 0 || end < 0 || end < start) throw new Error('key render region not found');
 const tb = { innerHTML: '' };
 const ctx = {
-  cfgKeyRows: [], keyShown: false, Number,
+  cfgKeyRows: [], keyShown: false, Number, Set,
   esc: s => String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
   $: id => id === 'cfgKeyList' ? tb : null,
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.renderKeyList=renderKeyList;this.paintKeyRows=paintKeyRows;', ctx);
 ctx.renderKeyList({ api_keys: [
-  { name: 'prod', key: 'sk-prod', enabled: true, daily_credit_limit: 25.5 },
+  { name: 'prod', key: 'sk-prod', enabled: true, daily_credit_limit: 25.5, allowed_models: ['cn:glm-5.2'] },
   { name: 'qa', key: 'sk-qa', enabled: true },
 ] });
 process.stdout.write(JSON.stringify({
   limits: ctx.cfgKeyRows.map(k => k.daily_credit_limit),
+  models: ctx.cfgKeyRows.map(k => k.allowed_models),
+  modelClass: tb.innerHTML.includes('class="ms-btn k-models'),
   hasDecimal: tb.innerHTML.includes('value="25.5"'),
   unlimitedBlank: tb.innerHTML.includes('placeholder="不限"'),
 }));`
@@ -1013,9 +1024,70 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("renderKeyList node test failed: %v\n%s", err, out)
 	}
-	const want = `{"limits":[25.5,0],"hasDecimal":true,"unlimitedBlank":true}`
+	const want = `{"limits":[25.5,0],"models":[["cn:glm-5.2"],[]],"modelClass":true,"hasDecimal":true,"unlimitedBlank":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("renderKeyList=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSRenderKeyModelMenu 下拉多选：按域分组、选中项勾选、空白名单显示“不限制”。
+func TestAppJSRenderKeyModelMenu(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model menu test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function normalizeModelIDs');
+const end = src.indexOf('function positionKeyModelMenu');
+if (start < 0 || end < 0 || end < start) throw new Error('model picker region not found');
+const listEl = { innerHTML: '' }, noteEl = { textContent: '' };
+const ctx = {
+  cfgKeyRows: [{ allowed_models: ['cn:glm-5.2'] }],
+  keyNewAllowedModels: [], keyModelPick: { kind: 'row', index: 0, btn: null },
+  keyModelQuery: '', keyModelCatalog: [
+    { id: 'global:gpt-5.6-sol', name: 'GPT Sol' },
+    { id: 'cn:glm-5.2', name: 'GLM 5.2' },
+  ],
+  mdAll: [], keyModelLoadPromise: null, keyModelLoadError: '',
+  Math, Array, Object, String, Set, Map,
+  esc: s => String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+  $: id => id === 'keyModelList' ? listEl : (id === 'keyModelNote' ? noteEl : null),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderKeyModelMenu=renderKeyModelMenu;', ctx);
+ctx.renderKeyModelMenu();
+const one = {
+  note: noteEl.textContent,
+  all: listEl.innerHTML.includes('data-ms-all'),
+  selected: listEl.innerHTML.includes('data-ms-id="cn:glm-5.2" checked'),
+  other: listEl.innerHTML.includes('data-ms-id="global:gpt-5.6-sol"'),
+  grouped: listEl.innerHTML.indexOf('国内版 CN') < listEl.innerHTML.indexOf('国际版 Global'),
+};
+ctx.cfgKeyRows[0].allowed_models = [];
+ctx.renderKeyModelMenu();
+const empty = {
+  note: noteEl.textContent,
+  allChecked: listEl.innerHTML.includes('data-ms-all checked'),
+};
+process.stdout.write(JSON.stringify({ one, empty }));`
+	f, err := os.CreateTemp(t.TempDir(), "key-models-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model menu node test failed: %v\n%s", err, out)
+	}
+	const want = `{"one":{"note":"已选 1 个模型","all":true,"selected":true,"other":true,"grouped":true},` +
+		`"empty":{"note":"不限制","allChecked":true}}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model menu=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }
 
@@ -1669,7 +1741,9 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
  }
  const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
  const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
- const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},renderKeyList(){},toast(message){throw Error(message)}};
+ const ctx={cfgLoaded:null,keyNewAllowedModels:[],api:async()=>({config:cfg}),$:id=>nodes[id],
+   markDurationFields(){},renderKeyList(){},closeKeyModelPicker(){},syncNewKeyModelButton(){},
+   toast(message){throw Error(message)}};
  vm.createContext(ctx);
  vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
  (async()=>{

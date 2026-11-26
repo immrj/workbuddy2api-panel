@@ -183,7 +183,42 @@ input[type=checkbox] { width: auto; accent-color: var(--accent); }
 #keyNewVal { flex: 1 1 auto; min-width: 0; }
 #keyNewLimit { flex: 0 0 16%; min-width: 110px; }
 #cfgKeyList .k-limit { min-width: 110px; text-align: right; }
+#cfgKeyTable { min-width: 940px; }
+#cfgKeyTable .k-models-cell { min-width: 150px; }
+#keyNewModels { flex: 0 0 170px; min-width: 0; }
 .inline { display: flex; align-items: center; gap: 9px; }
+
+/* API Key 可用模型下拉多选：按钮在表格内，面板 fixed 定位挂到 body 上，
+   避免被 .tbl-wrap 的横向滚动容器裁切。 */
+.ms-btn { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; text-align: left; }
+.ms-btn::after { content: "▾"; flex: none; color: var(--ink-3); }
+.ms-pop {
+  position: fixed; z-index: 55; max-height: min(480px, 80vh);
+  display: flex; flex-direction: column; padding: 0;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 18px 48px -20px rgba(0,0,0,.65); overflow: hidden;
+}
+.ms-pop[hidden] { display: none; }
+.ms-pop-head, .ms-manual, .ms-foot { display: flex; align-items: center; gap: 8px; padding: 9px 10px; }
+.ms-pop-head { border-bottom: 1px solid var(--line-soft); }
+.ms-pop-head input { flex: 1 1 auto; width: auto; min-width: 0; }
+.ms-list { overflow: auto; min-height: 70px; padding: 5px; }
+.ms-group + .ms-group { border-top: 1px solid var(--line-soft); margin-top: 4px; padding-top: 4px; }
+.ms-group-label { padding: 4px 8px; color: var(--ink-3); font-size: 10.5px; font-weight: 600; letter-spacing: .3px; }
+.ms-opt { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+.ms-opt:hover { background: var(--surface-2); }
+.ms-opt input { width: auto; flex: none; margin: 0; }
+.ms-opt span { display: flex; flex-direction: column; min-width: 0; }
+.ms-opt code { font: 11.5px/1.35 var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+.ms-opt em { font-size: 10.5px; line-height: 1.3; color: var(--ink-3); font-style: normal; margin-top: 1px; }
+.ms-all { border-bottom: 1px solid var(--line-soft); border-radius: 0; margin-bottom: 3px; }
+.ms-all b { font-size: 12.5px; font-weight: 600; }
+.ms-all em { margin-top: 0; }
+.ms-empty { padding: 18px 10px; text-align: center; color: var(--ink-3); font-size: 12px; }
+.ms-manual { border-top: 1px solid var(--line-soft); }
+.ms-manual input { flex: 1 1 auto; width: auto; min-width: 0; }
+.ms-foot { border-top: 1px solid var(--line-soft); color: var(--ink-3); font-size: 11.5px; }
+.ms-foot .grow { flex: 1; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
@@ -964,13 +999,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="package_detail_limit" type="number" min="1" placeholder="5">
                 <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></div>
             </div>
-            <!-- 密钥表独立成块，不放 grid2：每行有名称/值/启用/删除四列，压到半栏
+            <!-- 密钥表独立成块，不放 grid2：每行有名称/值/模型范围/限额/启用/删除，
+                 压到半栏
                  会让密钥值只剩几十像素。它是整页最需要横向空间的表单区。 -->
             <div class="fld"><span class="lb">API 密钥</span>
               <div class="tbl-wrap">
-                <table class="acc zebra">
+                <table class="acc zebra" id="cfgKeyTable">
                   <thead><tr>
-                    <th>名称</th><th>密钥值</th><th class="num">每日积分上限</th><th class="c-acts">启用</th><th class="c-acts">操作</th>
+                    <th>名称</th><th>密钥值</th><th>可用模型</th><th class="num">每日积分上限</th><th class="c-acts">启用</th><th class="c-acts">操作</th>
                   </tr></thead>
                   <tbody id="cfgKeyList"></tbody>
                 </table>
@@ -978,11 +1014,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <div class="inline">
                 <input id="keyNewName" placeholder="新密钥名称" aria-label="新密钥名称">
                 <input id="keyNewVal" placeholder="留空自动生成" aria-label="新密钥值">
+                <button type="button" class="ms-btn xs" id="keyNewModels"
+                  aria-haspopup="dialog" aria-expanded="false" title="不限制：允许全部模型（含以后新增）">全部模型</button>
                 <input id="keyNewLimit" type="number" min="0" step="any" placeholder="每日上限（空=不限）" aria-label="新密钥每日积分上限">
                 <button type="button" class="xs" id="btnKeyAdd">添加密钥</button>
                 <button type="button" class="xs" id="btnEye">显示值</button>
               </div>
-              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。每日上限按已结算 usage.credit 计算，只限制 /v1/chat/completions；空或 0 = 不限。全删 = 关闭网关鉴权；启用面板登录后不影响 /panel/*。</span>
+              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。可用模型为空 = 不限制；选中的模型会同时限制 /v1/models 列表与 /v1/chat/completions 点名调用。手动输入裸模型名表示 CN/global 两域都允许，带 <code>cn:</code>/<code>global:</code> 前缀则只允许该域。每日上限按已结算 usage.credit 计算，只限制 /v1/chat/completions；空或 0 = 不限。全删 = 关闭网关鉴权；启用面板登录后不影响 /panel/*。</span>
             </div>
           </div>
         </div>
@@ -1443,6 +1481,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnRemarkClose">关闭</button>
       <button class="primary" id="btnRemarkSave">保存</button>
     </footer>
+  </div>
+</div>
+
+<!-- API Key 可用模型：fixed 定位在按钮下方，避免被表格滚动容器裁切 -->
+<div class="ms-pop" id="keyModelMenu" hidden role="dialog" aria-label="选择可用模型">
+  <div class="ms-pop-head">
+    <input id="keyModelSearch" type="search" placeholder="搜索模型 ID / 名称" aria-label="搜索模型">
+    <button type="button" class="xs" id="btnKeyModelClose">关闭</button>
+  </div>
+  <div class="ms-list" id="keyModelList"></div>
+  <div class="ms-manual">
+    <input id="keyModelManual" placeholder="手动输入模型 ID，如 cn:glm-5.2" aria-label="手动输入模型 ID">
+    <button type="button" class="xs" id="btnKeyModelAdd">添加</button>
+  </div>
+  <div class="ms-foot">
+    <span id="keyModelNote">不限制</span>
+    <span class="grow"></span>
+    <button type="button" class="xs" id="btnKeyModelAll">全部模型</button>
   </div>
 </div>
 

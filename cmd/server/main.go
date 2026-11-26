@@ -67,6 +67,7 @@ func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
 			Key:              k.Key,
 			Enabled:          k.Enabled,
 			DailyCreditLimit: k.DailyCreditLimit,
+			AllowedModels:    append([]string(nil), k.AllowedModels...),
 		})
 	}
 	return out

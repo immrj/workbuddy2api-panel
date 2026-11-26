@@ -20,6 +20,7 @@ type APIKey struct {
 	Key              string
 	Enabled          bool
 	DailyCreditLimit float64
+	AllowedModels    []string
 }
 
 // Snapshot 一次读取的不可变配置视图。
@@ -61,6 +62,11 @@ func (h *Holder) Load() Snapshot {
 	if len(s.APIKeys) > 0 {
 		out.APIKeys = make([]APIKey, len(s.APIKeys))
 		copy(out.APIKeys, s.APIKeys)
+		// APIKey 内的 AllowedModels 是切片：只复制外层 []APIKey 仍会共享
+		// 模型白名单的底层数组，读者侧 append/改元素会污染 Holder。
+		for i := range out.APIKeys {
+			out.APIKeys[i].AllowedModels = append([]string(nil), s.APIKeys[i].AllowedModels...)
+		}
 	}
 	return out
 }
@@ -68,17 +74,17 @@ func (h *Holder) Load() Snapshot {
 // Store 整体替换快照。
 func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
 
-// NormalizeHiddenModels 把用户配置的 hidden 条目归一化为精确 id 集合。
+// normalizeModelSet 把模型条目归一化为精确 id 集合。
 //
-// 条目带合法 "cn:"/"global:" 前缀 → 只隐藏该域；裸名 → 两域都隐藏。
+// 条目带合法 "cn:"/"global:" 前缀 → 只作用于该域；裸名 → 两域都覆盖。
 // 大小写敏感（与 internal/server.resolveModel 的前缀规则对称：取第一个 ":",
 // 前段恰为 "cn"/"global" 才剥离）。返回的 map 只读共享，调用方不得修改。
-func NormalizeHiddenModels(hidden []string) map[string]struct{} {
-	if len(hidden) == 0 {
+func normalizeModelSet(models []string) map[string]struct{} {
+	if len(models) == 0 {
 		return nil
 	}
-	out := make(map[string]struct{}, len(hidden)*2)
-	for _, m := range hidden {
+	out := make(map[string]struct{}, len(models)*2)
+	for _, m := range models {
 		m = strings.TrimSpace(m)
 		if m == "" {
 			continue
@@ -94,4 +100,15 @@ func NormalizeHiddenModels(hidden []string) map[string]struct{} {
 		return nil
 	}
 	return out
+}
+
+// NormalizeHiddenModels 把 models.hidden 归一化为精确 id 集合。
+func NormalizeHiddenModels(hidden []string) map[string]struct{} {
+	return normalizeModelSet(hidden)
+}
+
+// NormalizeAllowedModels 把 API Key 的 allowed_models 归一化为精确 id 集合。
+// nil/空集合 = 不限制；非空集合 = 仅允许集合内的 (域, 模型)。
+func NormalizeAllowedModels(allowed []string) map[string]struct{} {
+	return normalizeModelSet(allowed)
 }

@@ -67,6 +67,8 @@
   /* .acc 与 .acc.md 在桌面端都带 min-width（640px / 700px）：卡片模式必须一并清掉，
      否则模型表不是"卡片"而是"被裁掉右半边"。 */
   .acc, .acc.md { display: block; width: 100%; min-width: 0; }
+  #cfgKeyTable { min-width: 0; }
+  #cfgKeyTable .k-models-cell { min-width: 0; }
   .acc thead { display: none; }
   .acc tbody { display: block; }
   /* 装表格的 .box 退成透明容器，卡片直接浮在页面底上（参考图口径）。
@@ -148,6 +150,15 @@
   #mdBody tr > td:nth-child(3), #mdBody tr > td:nth-child(4),
   #mdBody tr > td:nth-child(6), #mdBody tr > td:nth-child(7) { grid-column: span 3; }
   #mdBody tr > .efs { grid-column: 1 / 13; order: 2; min-width: 0; flex-wrap: wrap; gap: 3px; }
+
+  /* 配置页密钥卡：名称 / 密钥 / 可用模型各占整行，限额与启用并排，删除单独一行。 */
+  #cfgKeyTable tr > td:nth-child(1), #cfgKeyTable tr > td:nth-child(2),
+  #cfgKeyTable tr > td:nth-child(3) { grid-column: 1 / -1; }
+  #cfgKeyTable tr > td:nth-child(4) { grid-column: span 6; }
+  #cfgKeyTable tr > td:nth-child(5) { grid-column: span 6; justify-content: flex-end; }
+  #cfgKeyTable tr > td:nth-child(6) { grid-column: 1 / -1; }
+  #cfgKeyTable tr > td.c-acts { width: auto; }
+  #cfgKeyTable tr > td.c-acts button { width: 100%; }
 
   /* 用量明细 / 积分扣除（.acc.zebra）：列由 JS 按维度动态生成（账号/模型/域列数不同），
      不能写死 nth-child。第一个可见列（名称）整行，其余指标每格 3/12 自动流式排布。
@@ -268,7 +279,7 @@
   .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); }
   /* 密钥新增行在窄屏改为纵向堆叠，避免名称/密钥/额度/按钮互相挤压。 */
   .inline { flex-wrap: wrap; }
-  #keyNewName, #keyNewVal, #keyNewLimit { flex: 1 1 100%; min-width: 0; }
+  #keyNewName, #keyNewVal, #keyNewLimit, #keyNewModels { flex: 1 1 100%; min-width: 0; }
   /* 任务中心：每项也是一张卡（标题+状态 / 进度+编码 / 信息） */
   .qgroup { padding: 0 0 12px; }
   .qgroup header { padding: 6px 2px 6px; }
