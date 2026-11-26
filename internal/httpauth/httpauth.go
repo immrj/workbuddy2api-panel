@@ -1,8 +1,7 @@
-// Package httpauth 网关与面板共用的 Bearer 鉴权原语。
+// Package httpauth API Key Bearer 鉴权原语。
 //
-// 单独成包的原因：server（/v1/*、/status）与 panel（/panel/api/*）两处鉴权
-// 必须完全同口径——此前各自复制了一份"字符串直接比较"的实现，既容易漂移，
-// 又都带计时侧信道。统一到这里后，口径只有一份，且天然常量时间比较。
+// server（/v1/*、/status）始终使用本包；panel 在未启用 panel_auth 或显式开启
+// API Key 兼容时复用同一套校验，保证两侧口径一致且天然常量时间比较。
 package httpauth
 
 import (

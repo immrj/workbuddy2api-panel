@@ -49,7 +49,7 @@ type Config struct {
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
-	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
+	// 面板自带独立鉴权（panel_auth 或兼容 Bearer）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
 
 	// Live 运行期可变配置（面板在线改 api_key / soft_rate / 脱敏开关时立即生效）。

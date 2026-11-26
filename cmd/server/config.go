@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panelauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
@@ -112,6 +113,15 @@ type Config struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`
+	// PanelAuth 管理面板独立用户名密码登录。缺省 enabled=false，沿用历史
+	// Bearer API Key 面板鉴权；/v1/* 永远不受本段影响。
+	PanelAuth struct {
+		Enabled      bool   `json:"enabled"`
+		Username     string `json:"username,omitempty"`
+		PasswordHash string `json:"password_hash,omitempty"`
+		SessionTTL   string `json:"session_ttl,omitempty"`
+		AllowAPIKey  bool   `json:"allow_api_key,omitempty"`
+	} `json:"panel_auth"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -346,6 +356,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// PanelAuthSessionTTL 解析后的面板会话有效期。
+	PanelAuthSessionTTL time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -360,6 +372,8 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
+	c.PanelAuth.Username = "admin"
+	c.PanelAuth.SessionTTL = "12h"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -586,6 +600,9 @@ func (c *Config) normalize() error {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	if err := c.normalizePanelAuth(); err != nil {
+		return err
+	}
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
@@ -772,6 +789,46 @@ func (c *Config) normalizeAPIKeys() error {
 				k.Name, DefaultKeyName)
 		}
 		names[k.Name] = true
+	}
+	return nil
+}
+
+// normalizePanelAuth 校验独立的用户名密码配置。enabled=false 时允许字段留空，
+// 以便保留旧配置/旧面板行为；一旦启用，用户名、Argon2id 哈希与正时长必须齐全。
+func (c *Config) normalizePanelAuth() error {
+	c.PanelAuth.Username = strings.TrimSpace(c.PanelAuth.Username)
+	c.PanelAuth.PasswordHash = strings.TrimSpace(c.PanelAuth.PasswordHash)
+	if c.PanelAuth.SessionTTL == "" {
+		c.PanelAuth.SessionTTL = "12h"
+	}
+	d, err := time.ParseDuration(c.PanelAuth.SessionTTL)
+	if err != nil {
+		return fmt.Errorf("panel_auth.session_ttl: %w", err)
+	}
+	if d < time.Minute {
+		return fmt.Errorf("panel_auth.session_ttl 不能小于 1m")
+	}
+	if d > 30*24*time.Hour {
+		return fmt.Errorf("panel_auth.session_ttl 不能超过 720h")
+	}
+	c.PanelAuthSessionTTL = d
+	if !c.PanelAuth.Enabled {
+		return nil
+	}
+	if c.PanelAuth.Username == "" {
+		return fmt.Errorf("panel_auth.username 不能为空")
+	}
+	if len(c.PanelAuth.Username) > 64 {
+		return fmt.Errorf("panel_auth.username 长度不能超过 64")
+	}
+	if strings.ContainsAny(c.PanelAuth.Username, "\r\n\x00") {
+		return fmt.Errorf("panel_auth.username 含非法控制字符")
+	}
+	if c.PanelAuth.PasswordHash == "" {
+		return fmt.Errorf("panel_auth.password_hash 不能为空；请先运行 go run ./cmd/panelpass 生成")
+	}
+	if err := panelauth.ValidateHash(c.PanelAuth.PasswordHash); err != nil {
+		return fmt.Errorf("panel_auth.password_hash: %w", err)
 	}
 	return nil
 }

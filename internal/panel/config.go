@@ -17,6 +17,8 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "config api not available")
 		return
 	}
+	// 配置包含 API 密钥明文（password_hash 已单独脱敏），禁止浏览器/代理缓存。
+	w.Header().Set("Cache-Control", "no-store")
 	cfg, err := p.cfg.LoadConfig()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "load config: "+err.Error())

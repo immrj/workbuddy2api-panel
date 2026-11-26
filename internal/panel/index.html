@@ -351,6 +351,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
 .dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
 .dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.auth-form .fld:last-child { margin-bottom: 0; }
+.auth-sep { display: flex; align-items: center; gap: 10px; color: var(--ink-3); font-size: 11.5px; margin: 17px 0 13px; }
+.auth-sep::before, .auth-sep::after { content: ""; height: 1px; background: var(--line-soft); flex: 1; }
 .tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
@@ -649,7 +652,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </ul>
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
-      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span> · <span id="navUser"></span></div>
     </div>
   </nav>
 
@@ -666,6 +669,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
+      <button id="btnLogout" hidden>退出</button>
       <button id="btnRefresh">刷新</button>
       <button class="primary" id="btnAdd">添加账号</button>
     </div>
@@ -978,8 +982,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <button type="button" class="xs" id="btnKeyAdd">添加密钥</button>
                 <button type="button" class="xs" id="btnEye">显示值</button>
               </div>
-              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。每日上限按已结算 usage.credit 计算，只限制 /v1/chat/completions；空或 0 = 不限。全删 = 关闭鉴权。</span>
+              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。每日上限按已结算 usage.credit 计算，只限制 /v1/chat/completions；空或 0 = 不限。全删 = 关闭网关鉴权；启用面板登录后不影响 /panel/*。</span>
             </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>面板登录</h3><span class="grow"></span><span class="note">仅影响 /panel/*，不改变 /v1/*</span></header>
+          <div class="pad">
+            <div class="grid2">
+              <div class="switch"><span class="lb">启用用户名密码登录</span>
+                <input type="checkbox" name="panel_auth_enabled"></div>
+              <label class="fld"><span class="lb">会话有效期</span>
+                <input name="panel_auth_session_ttl" placeholder="12h">
+                <span class="hint">Go 时长格式，例如 12h；修改后旧会话仍有效，直到自然过期</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">用户名</span>
+                <input name="panel_auth_username" autocomplete="username" placeholder="admin"></label>
+              <label class="fld"><span class="lb">新密码</span>
+                <input id="panelAuthPassword" type="password" autocomplete="new-password" placeholder="留空 = 不修改">
+                <span class="hint" id="panelAuthPwState">尚未设置密码</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">确认新密码</span>
+                <input id="panelAuthPassword2" type="password" autocomplete="new-password" placeholder="再次输入新密码"></label>
+              <div class="switch"><span class="lb">允许旧 API Key 访问面板</span>
+                <input type="checkbox" name="panel_auth_allow_api_key"></div>
+            </div>
+            <span class="hint">密码以 Argon2id 哈希保存，浏览器只提交明文一次、服务端落盘前完成哈希。启用后页面改用 HttpOnly 会话 Cookie；兼容开关只建议在迁移期打开，稳定后可关闭。</span>
           </div>
         </div>
 
@@ -1365,20 +1396,33 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<!-- 密钥 -->
+<!-- 面板登录 -->
 <div class="veil" id="keyVeil" data-lock="1">
   <div class="dlg" style="width:420px">
     <header>
-      <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
+      <h3 id="authTitle">登录管理面板</h3>
+      <div class="hint" id="authHint">使用管理员用户名和密码登录。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
-      <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
+      <form id="loginForm" class="auth-form">
+        <label class="fld"><span class="lb">用户名</span>
+          <input id="loginUser" autocomplete="username" placeholder="admin"></label>
+        <label class="fld"><span class="lb">密码</span>
+          <input id="loginPass" type="password" autocomplete="current-password" placeholder="密码"></label>
+      </form>
+      <div id="keyAuthBlock" hidden>
+        <div class="auth-sep" id="authSep">或使用 API Key</div>
+        <form id="keyForm" class="auth-form">
+          <label class="fld"><span class="lb">API Key</span>
+            <input id="keyInput" type="password" autocomplete="off" placeholder="api_key"></label>
+        </form>
+      </div>
+      <div class="state err" id="authErr" hidden style="margin-top:10px"></div>
     </div>
     <footer>
       <span class="grow"></span>
-      <button class="primary" id="btnKey">进入</button>
+      <button class="primary" id="btnLogin">登录</button>
+      <button class="primary" id="btnKey" hidden>使用密钥进入</button>
     </footer>
   </div>
 </div>

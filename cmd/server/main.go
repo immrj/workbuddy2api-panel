@@ -14,8 +14,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
@@ -23,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panelauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -34,7 +37,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.0-panel"
+const appVersion = "1.16.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -321,6 +324,23 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	panelAuth, err := panelauth.New(panelauth.Config{
+		Enabled:      cfg.PanelAuth.Enabled,
+		Username:     cfg.PanelAuth.Username,
+		PasswordHash: cfg.PanelAuth.PasswordHash,
+		SessionTTL:   cfg.PanelAuthSessionTTL,
+		AllowAPIKey:  cfg.PanelAuth.AllowAPIKey,
+	})
+	if err != nil {
+		log.Fatalf("panel auth: %v", err)
+	}
+	if cfg.PanelAuth.Enabled {
+		log.Printf("panel: 用户名密码登录已启用（user=%s，会话 %s，API Key 兼容=%v）",
+			cfg.PanelAuth.Username, cfg.PanelAuthSessionTTL, cfg.PanelAuth.AllowAPIKey)
+	} else {
+		log.Printf("panel: 未启用用户名密码登录，沿用 Bearer API Key")
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -333,15 +353,16 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		PanelAuth:   panelAuth,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
+			return loadPanelConfig(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, panelAuth)
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -475,10 +496,34 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
+// loadPanelConfig 给配置页返回可安全展示的视图：panel_auth.password_hash
+// 永远不下发浏览器，只透出 password_configured 供表单显示"留空=不修改"。
+func loadPanelConfig(path string) (any, error) {
+	cfg, err := Load(path)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var view map[string]any
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return nil, err
+	}
+	configured := strings.TrimSpace(cfg.PanelAuth.PasswordHash) != ""
+	if pa, ok := view["panel_auth"].(map[string]any); ok {
+		delete(pa, "password_hash")
+		pa["password_configured"] = configured
+	}
+	return view, nil
+}
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - panel_auth → 运行期认证器（密码/用户名变化时旧会话全部失效）
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
@@ -488,7 +533,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, panelAuth ...*panelauth.Service) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -501,7 +546,33 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, fmt.Errorf("parse submitted config: %w", err)
 	}
+	// 面板表单提交的是明文新密码；这里只把它转成 Argon2id 哈希写盘，
+	// 明文不进入 config.json，也不进入 ParseConfig 的强类型对象。
+	if rawPW, ok := incoming["panel_password"]; ok {
+		pw, ok := rawPW.(string)
+		if !ok {
+			return nil, fmt.Errorf("panel_password 必须是字符串")
+		}
+		if utf8.RuneCountInString(pw) < 8 {
+			return nil, fmt.Errorf("面板密码至少 8 个字符")
+		}
+		if len(pw) > 128 {
+			return nil, fmt.Errorf("面板密码不能超过 128 字节")
+		}
+		hash, err := panelauth.HashPassword(pw)
+		if err != nil {
+			return nil, fmt.Errorf("生成面板密码哈希: %w", err)
+		}
+		pa, ok := incoming["panel_auth"].(map[string]any)
+		if !ok {
+			pa = map[string]any{}
+			incoming["panel_auth"] = pa
+		}
+		pa["password_hash"] = hash
+		delete(incoming, "panel_password")
+	}
 	merged := mergeConfigMaps(cur, incoming)
+	delete(merged, "panel_password")
 
 	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
 	newCfg, err := ParseConfig(mergedJSON(merged))
@@ -555,6 +626,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
+	if len(panelAuth) > 0 && panelAuth[0] != nil {
+		if _, err := panelAuth[0].Update(panelauth.Config{
+			Enabled:      newCfg.PanelAuth.Enabled,
+			Username:     newCfg.PanelAuth.Username,
+			PasswordHash: newCfg.PanelAuth.PasswordHash,
+			SessionTTL:   newCfg.PanelAuthSessionTTL,
+			AllowAPIKey:  newCfg.PanelAuth.AllowAPIKey,
+		}); err != nil {
+			return nil, fmt.Errorf("apply panel auth: %w", err)
+		}
+	}
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)

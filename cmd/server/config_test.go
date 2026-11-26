@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panelauth"
 )
 
 func TestDefault(t *testing.T) {
@@ -45,6 +47,63 @@ func TestPanelPackageDetailLimit(t *testing.T) {
 	}
 	if fallback.Panel.PackageDetailLimit != 5 {
 		t.Fatalf("fallback package_detail_limit=%d want 5", fallback.Panel.PackageDetailLimit)
+	}
+}
+
+func TestPanelAuthConfig(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.PanelAuth.Enabled || c.PanelAuthSessionTTL != 12*time.Hour {
+		t.Fatalf("panel auth defaults = %+v ttl=%v", c.PanelAuth, c.PanelAuthSessionTTL)
+	}
+	if _, err := ParseConfig([]byte(`{"panel_auth":{"enabled":true,"username":"admin"}}`)); err == nil {
+		t.Fatal("enabled panel auth without password hash must fail")
+	}
+
+	hash, err := panelauth.HashPasswordWithParams("test-password", panelauth.HashParams{
+		Memory: 8 * 1024, Time: 1, Threads: 1, SaltLength: 16, KeyLength: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"panel_auth":{"enabled":true,"username":"admin","password_hash":"` + hash + `","session_ttl":"2h","allow_api_key":true}}`)
+	cfg, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.PanelAuth.Enabled || cfg.PanelAuth.Username != "admin" || !cfg.PanelAuth.AllowAPIKey ||
+		cfg.PanelAuthSessionTTL != 2*time.Hour {
+		t.Fatalf("panel auth parsed = %+v ttl=%v", cfg.PanelAuth, cfg.PanelAuthSessionTTL)
+	}
+}
+
+func TestLoadPanelConfigRedactsPasswordHash(t *testing.T) {
+	hash, err := panelauth.HashPasswordWithParams("test-password", panelauth.HashParams{
+		Memory: 8 * 1024, Time: 1, Threads: 1, SaltLength: 16, KeyLength: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := filepath.Join(t.TempDir(), "config.json")
+	raw := []byte(`{"listen":":7863","api_key":"k","panel_auth":{"enabled":true,"username":"admin","password_hash":"` + hash + `"}}`)
+	if err := os.WriteFile(fp, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	view, err := loadPanelConfig(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), hash) || strings.Contains(string(b), "password_hash") {
+		t.Fatalf("password hash leaked: %s", b)
+	}
+	if !strings.Contains(string(b), `"password_configured":true`) {
+		t.Fatalf("missing password_configured: %s", b)
 	}
 }
 

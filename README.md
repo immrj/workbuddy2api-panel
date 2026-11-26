@@ -392,12 +392,13 @@ curl -s http://localhost:7863/v1/search/messages \
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 单条网关鉴权密钥（**向后兼容的旧字段**）；空 = 不鉴权。新配置建议改用 `api_keys` |
-| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true,"daily_credit_limit":50}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。`daily_credit_limit` 是该密钥每个**本地自然日**的已结算积分上限，`0` / 缺省 = 不限；达到上限后拒绝下一次 `/v1/chat/completions`（`429 daily_credit_limit_exceeded`），不改动状态、模型列表、搜索与面板访问。积分只在上游返回 `usage.credit` 后结算，因此触发上限的那一条请求可能小幅超出。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**，任一启用密钥都能通过网关与面板鉴权；**生效表中没有启用的密钥（表为空或全部停用）= 不鉴权** |
+| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true,"daily_credit_limit":50}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。`daily_credit_limit` 是该密钥每个**本地自然日**的已结算积分上限，`0` / 缺省 = 不限；达到上限后拒绝下一次 `/v1/chat/completions`（`429 daily_credit_limit_exceeded`），不改动状态、模型列表或搜索。积分只在上游返回 `usage.credit` 后结算，因此触发上限的那一条请求可能小幅超出。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**；未启用 `panel_auth` 时任一启用密钥也能访问面板，**生效表中没有启用的密钥（表为空或全部停用）= 网关不鉴权** |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
+| `panel_auth` | 关闭 | 管理面板独立登录：`{"enabled":true,"username":"admin","password_hash":"argon2id$…","session_ttl":"12h","allow_api_key":false}`。`password_hash` 用 `go run ./cmd/panelpass` 生成，禁止写明文密码；只影响 `/panel/*`，不改变 `/v1/*` 的 API Key 鉴权。`allow_api_key` 仅建议迁移期临时打开 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
@@ -737,7 +738,30 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 http://127.0.0.1:7863/panel/
 ```
 
-鉴权与 API 同口径：生效密钥表里**至少有一把启用密钥**时，面板要求输入一次密钥（浏览器 localStorage 记住），填**任意一把**启用的密钥都可以；一把启用的都没有则直接可用。
+鉴权分两种模式：
+
+- **推荐：用户名密码登录**。配置 `panel_auth.enabled=true`，用 `go run ./cmd/panelpass` 生成 `password_hash`，登录成功后服务端下发 `HttpOnly + SameSite=Strict` 会话 Cookie（HTTPS 下自动加 `Secure`）；修改类请求再校验会话绑定的 `X-CSRF-Token`。登录失败按客户端 IP + 用户名限流，用户名或密码变化会使旧会话全部失效；会话保存在进程内存，重启后需重新登录。`/v1/*` 和 `/status` 始终继续使用 API Key，不受面板密码影响。
+- **兼容：API Key 登录**。未启用 `panel_auth` 时沿用原行为：生效密钥表里至少有一把启用密钥，面板要求输入任意一把（浏览器 localStorage 记住）；一把启用的都没有则直接可用。启用 `panel_auth` 后如需过渡兼容，可临时设置 `allow_api_key=true`。
+
+生成哈希并写入配置：
+
+```bash
+go run ./cmd/panelpass
+# Docker 部署：
+docker compose exec wb2api /app/panelpass
+```
+
+```json
+"panel_auth": {
+  "enabled": true,
+  "username": "admin",
+  "password_hash": "argon2id$v=19$m=65536,t=3,p=2$…",
+  "session_ttl": "12h",
+  "allow_api_key": false
+}
+```
+
+也可以先沿用旧 API Key 登录，在面板「配置 → 面板登录」里勾选启用并设置新密码；保存后立即切换为用户名密码登录。
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
 
 | 视图 | 功能 |
@@ -747,7 +771,7 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
+| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、面板登录（用户名 / 新密码 / 会话 TTL / API Key 兼容开关）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
@@ -777,7 +801,7 @@ http://127.0.0.1:7863/panel/
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
-**配置热生效**：保存配置后，`api_key` / `api_keys`（增删密钥、启停密钥、修改 `daily_credit_limit`**下一个请求即生效，无需重启**）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key` / `api_keys`（增删密钥、启停密钥、修改 `daily_credit_limit`**下一个请求即生效，无需重启**）、`panel_auth`（用户名/密码/会话策略）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -785,10 +809,11 @@ http://127.0.0.1:7863/panel/
 
 ### 面板接口（`/panel/api/*`）
 
-与页面同一 Bearer 鉴权，可直接脚本化调用：
+鉴权取决于 `panel_auth`：启用后用页面会话 Cookie，修改类请求还需 `X-CSRF-Token`；旧脚本可在迁移期设置 `allow_api_key=true` 继续用 `Authorization: Bearer <api_key>`。未启用时仍与过去一样使用同一套 Bearer 鉴权，可直接脚本化调用：
 
 | 分组 | 端点 |
 |---|---|
+| 登录 | `GET auth/session`（当前会话/登录模式）· `POST auth/login`（用户名密码）· `POST auth/logout` |
 | 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
@@ -800,7 +825,7 @@ http://127.0.0.1:7863/panel/
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
-**鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
+**鉴权实现**：面板密码使用 Argon2id PHC 哈希（64 MiB / 3 轮 / 2 并发），会话是服务端随机不透明 token，不在 Cookie 中放用户名或签名载荷；Cookie `HttpOnly + SameSite=Strict + Path=/panel`，跨站脚本读不到、`/v1/*` 也不会携带。网关 Bearer 仍由 `internal/httpauth` 用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
 
@@ -960,7 +985,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 ### 2. 网络暴露与日志敏感度
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
-- **任一把网关密钥都等同于管理凭证**：面板 `/panel/api/*`（含读取与改写配置）与网关**共用同一张密钥表**，因此持有任意一把启用密钥即可在「配置」页读到**其余所有密钥的明文**，并可增删/停用它们。这是单 `api_key` 时代语义的自然延续（那时唯一的密钥本就是根凭证），但多密钥之后含义变了：**不要把面板暴露到不受信网络，也不要把网关密钥交给只应调用 `/v1/chat/completions` 的第三方**。若需要按租户分发密钥，请为面板单独前置一层访问控制
+- **启用 `panel_auth` 后，网关密钥不再天然等于管理凭证**：面板由独立用户名密码与会话保护，`/v1/*` 密钥只用于网关调用。仍建议公网面板置于 HTTPS 反代之后；若为了迁移临时打开 `allow_api_key=true`，任一启用密钥仍可进入面板，应尽快关闭。
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / **API 密钥（掩码，形如 `sk-a****3f2`：首 3 位 + 固定 4 个 `*` + 末 3 位）与密钥名称** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头；密钥只落掩码，星号数固定 4 个不随长度变化；长度 ≤ 6 时只出 4 个 `*`）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 

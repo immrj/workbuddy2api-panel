@@ -4,9 +4,9 @@
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
-//   - 鉴权复用网关**密钥表**（Bearer，任一启用密钥均可），与 /v1/* 同一口径；
-//     生效表中无启用密钥 = 不鉴权
-//     （仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给 /panel/api/*；
+//   - 鉴权默认复用网关 Bearer 密钥表；启用 panel_auth 后改用独立用户名密码与
+//     HttpOnly 会话 Cookie，并可选择临时保留 API Key 兼容入口。面板 HTML 本身
+//     无秘密，可匿名加载，数据接口 /panel/api/* 才走鉴权；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
 //     添加账号走 auth.SaveAtomic + pool.Add，重启后与 auths/ 目录天然对齐。
 package panel
@@ -26,6 +26,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panelauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -41,6 +42,7 @@ type Config struct {
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 静态单键回退（兼容既有 fixture）；空 = 不鉴权
 	APIKeys   []httpauth.APIKey    // 静态密钥表；与 Live 同时给出时 Live 优先
+	PanelAuth *panelauth.Service   // 用户名密码认证；nil/未启用时沿用 Bearer API Key
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
 
@@ -157,6 +159,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
 	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
+	p.mux.HandleFunc("GET /panel/api/auth/session", p.authSession)
+	p.mux.HandleFunc("POST /panel/api/auth/login", p.authLogin)
+	p.mux.HandleFunc("POST /panel/api/auth/logout", p.authLogout)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
@@ -207,11 +212,31 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
+// withAuth 面板接口入口鉴权。
+//
+// 启用 panel_auth 后优先校验 HttpOnly 会话 Cookie；POST/PUT/PATCH/DELETE 还必须
+// 携带该会话绑定的 X-CSRF-Token。allow_api_key=true 时短期兼容旧 Bearer 入口。
+// 未启用 panel_auth 时完全沿用历史 Bearer 规则（空密钥表 = 不鉴权）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if p.cfg.PanelAuth != nil && p.cfg.PanelAuth.Enabled() {
+			if sess, ok := p.sessionFromRequest(r); ok {
+				if methodNeedsCSRF(r.Method) && !p.cfg.PanelAuth.VerifyCSRF(sess, r.Header.Get("X-CSRF-Token")) {
+					writeErr(w, http.StatusForbidden, "invalid_csrf_token")
+					return
+				}
+				next(w, r)
+				return
+			}
+			if keys := p.apiKeyFallbackKeys(); len(keys) > 0 {
+				if _, ok := httpauth.VerifyAnyBearer(r, keys); ok {
+					next(w, r)
+					return
+				}
+			}
+			writeErr(w, http.StatusUnauthorized, "authentication_required")
+			return
+		}
 		if _, ok := httpauth.VerifyAnyBearer(r, p.apiKeys()); !ok {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return

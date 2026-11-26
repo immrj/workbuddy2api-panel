@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panelauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -88,5 +89,48 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 	}
 	if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID != "a" {
 		t.Fatalf("invalid save changed strategy: %v", a)
+	}
+}
+
+func TestSavePanelAuthHashesPasswordAndHotApplies(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(fp, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := panelauth.New(panelauth.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"panel_auth":{"enabled":true,"username":"admin","session_ttl":"1h"},"panel_password":"strong-password"}`)
+	if _, err := saveConfig(raw, fp, livecfg.New(livecfg.Snapshot{}), pool.New(""), upstream.New(), scheduler.New(scheduler.Config{}), svc); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "strong-password") || !strings.Contains(string(saved), "argon2id$") {
+		t.Fatalf("password not hashed before write: %s", saved)
+	}
+	if !svc.Enabled() {
+		t.Fatal("panel auth not hot-enabled")
+	}
+	if _, _, err := svc.Login("admin", "strong-password", "test"); err != nil {
+		t.Fatalf("new password cannot login: %v", err)
+	}
+	// 面板只改了其它字段、密码框留空时，必须保留磁盘中的哈希，不能把
+	// enabled=true 保存成空 hash。
+	if _, err := saveConfig(
+		[]byte(`{"panel_auth":{"enabled":true,"username":"admin","session_ttl":"2h"}}`),
+		fp, livecfg.New(livecfg.Snapshot{}), pool.New(""), upstream.New(), scheduler.New(scheduler.Config{}), svc,
+	); err != nil {
+		t.Fatalf("save without new password: %v", err)
+	}
+	saved, err = os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), "argon2id$") {
+		t.Fatalf("password hash lost on unrelated save: %s", saved)
 	}
 }

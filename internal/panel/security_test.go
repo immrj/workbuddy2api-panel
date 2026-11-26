@@ -3,6 +3,7 @@ package panel
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -92,6 +93,35 @@ func TestAppScriptServed(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "'use strict'") {
 		t.Error("app.js body looks wrong")
+	}
+}
+
+// 登录前端接线：用户名/密码、API Key 兼容入口、CSRF 头和配置面板字段缺一不可。
+func TestPanelAuthFrontendWiring(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`id="loginUser"`, `id="loginPass"`, `id="btnLogin"`, `id="keyInput"`,
+		`id="authErr"`, `id="btnLogout"`, `name="panel_auth_enabled"`,
+		`id="panelAuthPassword"`, `name="panel_auth_session_ttl"`,
+	} {
+		if !strings.Contains(string(html), want) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`/panel/api/auth/login`, `X-CSRF-Token`, `credentials: 'same-origin'`,
+		`bootstrapAuth()`, `panel_auth_session_ttl`,
+	} {
+		if !strings.Contains(string(js), want) {
+			t.Fatalf("app.js 缺少 %s", want)
+		}
 	}
 }
 

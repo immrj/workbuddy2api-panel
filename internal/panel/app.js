@@ -3,6 +3,10 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 /* 账号备注与「积分到期提醒」折叠的本机键（同上：模块级声明放顶部，避开 TDZ）。 */
 const LS_REMARKS = 'wb2api.remarks.v1', LS_EXP_FOLD = 'wb2api.expfold.v1';
+let authMode = 'none';          // none | api_key | password
+let csrfToken = '';
+let authUsername = '';
+let apiKeyAllowed = false;
 let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
@@ -45,12 +49,27 @@ applyTheme();
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
+  if (authMode !== 'password' && authMode !== 'none') {
+    const k = localStorage.getItem(LS_KEY);
+    if (k) h['Authorization'] = 'Bearer ' + k;
+  }
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    h['X-CSRF-Token'] = csrfToken;
+  }
+  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, {
+    headers: h, credentials: 'same-origin',
+  }));
   const d = await r.json().catch(() => ({}));
+  if (r.status === 401) {
+    await handleUnauthorized();
+    throw new Error('登录已过期或尚未登录');
+  }
+  if (r.status === 403 && d.error === 'invalid_csrf_token') {
+    await refreshAuthState();
+    throw new Error('页面安全令牌已刷新，请重试');
+  }
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
@@ -327,20 +346,166 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
-/* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+/* ── 登录门 ───────────────────────────────────────────────────────── */
+function setAuthError(msg) {
+  const el = $('authErr');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.hidden = !msg;
+}
+function updateAuthChrome() {
+  const logout = $('btnLogout');
+  if (logout) logout.hidden = !(authMode === 'password' && authUsername);
+  const who = $('navUser');
+  if (who) who.textContent = authMode === 'password' && authUsername ? '登录：' + authUsername : '';
+}
+function showAuthDialog(opts) {
+  const passwordMode = authMode === 'password';
+  $('authTitle').textContent = passwordMode ? '登录管理面板' : '需要访问密钥';
+  $('authHint').textContent = opts && opts.hint
+    ? opts.hint
+    : (passwordMode ? '使用管理员用户名和密码登录。' : '该网关使用 API Key 鉴权，请输入 config.json 中的密钥。');
+  $('loginForm').hidden = !passwordMode;
+  $('btnLogin').hidden = !passwordMode;
+  const showKey = passwordMode ? apiKeyAllowed : true;
+  $('keyAuthBlock').hidden = !showKey;
+  $('btnKey').hidden = !showKey;
+  if ($('authSep')) $('authSep').hidden = !passwordMode;
+  setAuthError('');
+  $('keyVeil').classList.add('on');
+  setTimeout(() => {
+    const focus = opts && opts.focusKey ? $('keyInput') : (passwordMode ? $('loginUser') : $('keyInput'));
+    if (focus) focus.focus();
+  }, 60);
+}
+function openLogin(hint) { showAuthDialog({ hint }); }
+function openKey(hint) {
+  if (authMode === 'password' && !apiKeyAllowed) return openLogin(hint);
+  showAuthDialog({ hint, focusKey: true });
+}
+async function fetchAuthStatus() {
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  const r = await fetch('/panel/api/auth/session', {
+    headers: h, credentials: 'same-origin', cache: 'no-store',
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+function applyAuthStatus(d) {
+  authMode = d.method || (d.configured ? 'password' : 'none');
+  apiKeyAllowed = !!d.allow_api_key;
+  if (d.authenticated) {
+    csrfToken = d.csrf_token || '';
+    authUsername = d.username || '';
+  } else {
+    csrfToken = '';
+    authUsername = '';
+  }
+  updateAuthChrome();
+}
+async function refreshAuthState() {
+  const d = await fetchAuthStatus();
+  applyAuthStatus(d);
+  return d;
+}
+async function handleUnauthorized() {
+  csrfToken = '';
+  authUsername = '';
+  try {
+    const d = await refreshAuthState();
+    if (d.configured || d.method === 'password') openLogin('登录已过期，请重新登录。');
+    else openKey('密钥无效或未填写。');
+  } catch (e) {
+    openLogin('登录状态读取失败，请重试。');
+  }
+}
+async function bootstrapAuth() {
+  try {
+    const d = await refreshAuthState();
+    if (!d.authenticated) {
+      if (d.configured) openLogin();
+      else if (d.method === 'api_key') openKey();
+      else start();
+      return;
+    }
+    $('keyVeil').classList.remove('on');
+    setAuthError('');
+    start();
+  } catch (e) {
+    toast('读取登录状态失败：' + e.message, 'err');
+    openLogin('无法连接面板，请检查服务状态后重试。');
+  }
+}
+async function doPasswordLogin() {
+  const u = $('loginUser').value.trim();
+  const p = $('loginPass').value;
+  if (!u || !p) { setAuthError('请输入用户名和密码。'); return; }
+  const btn = $('btnLogin');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const r = await fetch('/panel/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p }),
+      credentials: 'same-origin',
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (r.status === 429) setAuthError('登录尝试过多，请稍后再试。');
+      else if (r.status === 401) setAuthError('用户名或密码错误。');
+      else setAuthError(d.error || ('登录失败（HTTP ' + r.status + '）'));
+      return;
+    }
+    localStorage.removeItem(LS_KEY);
+    authMode = 'password';
+    csrfToken = d.csrf_token || '';
+    authUsername = d.username || u;
+    updateAuthChrome();
+    $('loginPass').value = '';
+    $('keyVeil').classList.remove('on');
+    setAuthError('');
+    start();
+  } catch (e) {
+    setAuthError('登录请求失败：' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '登录';
+  }
+}
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
   localStorage.setItem(LS_KEY, v);
+  authMode = 'api_key';
   try {
     await api('overview');
-    $('keyErr').hidden = true;
+    setAuthError('');
     $('keyVeil').classList.remove('on');
     start();
-  } catch (e) { $('keyErr').hidden = false; }
+  } catch (e) { setAuthError('密钥不正确，请重试。'); }
 };
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+$('loginForm').addEventListener('submit', e => { e.preventDefault(); doPasswordLogin(); });
+$('keyForm').addEventListener('submit', e => { e.preventDefault(); $('btnKey').click(); });
+$('loginPass').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); doPasswordLogin(); }
+});
+$('keyInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); $('btnKey').click(); }
+});
+$('btnLogin').onclick = doPasswordLogin;
+$('btnLogout').onclick = async () => {
+  try {
+    await fetch('/panel/api/auth/logout', {
+      method: 'POST', credentials: 'same-origin',
+      headers: csrfToken ? { 'X-CSRF-Token': csrfToken } : {},
+    });
+  } catch (e) {}
+  csrfToken = ''; authUsername = ''; authMode = 'password';
+  updateAuthChrome();
+  openLogin('已退出登录。');
+};
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -1172,6 +1337,10 @@ const CFG_MAP = {
   international_account_order: ['pool', 'account_order', 'international'],
   listen: ['listen'],
   package_detail_limit: ['panel', 'package_detail_limit'],
+  panel_auth_enabled: ['panel_auth', 'enabled'],
+  panel_auth_username: ['panel_auth', 'username'],
+  panel_auth_session_ttl: ['panel_auth', 'session_ttl'],
+  panel_auth_allow_api_key: ['panel_auth', 'allow_api_key'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
@@ -1232,6 +1401,14 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     renderKeyList(cfgLoaded); // 密钥表不走 CFG_MAP，单独回填（见 CFG_MAP 上方注）
+    const pa = cfgLoaded.panel_auth || {};
+    if ($('panelAuthPassword')) $('panelAuthPassword').value = '';
+    if ($('panelAuthPassword2')) $('panelAuthPassword2').value = '';
+    if ($('panelAuthPwState')) {
+      $('panelAuthPwState').textContent = pa.password_configured
+        ? '已设置密码；留空 = 不修改'
+        : '尚未设置密码';
+    }
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -1261,7 +1438,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'panel_auth_session_ttl'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -1323,7 +1501,7 @@ function paintKeyRows() {
         ' aria-label="启用第 ' + (i + 1) + ' 行密钥"></td>' +
       '<td class="c-acts"><button type="button" class="xs" data-kdel="' + i + '">删除</button></td>' +
     '</tr>'
-  ).join('') || '<tr><td colspan="5" class="empty">尚无密钥 —— 该状态下 /v1/*、/status 与面板自身均不鉴权</td></tr>';
+  ).join('') || '<tr><td colspan="5" class="empty">尚无密钥 —— 该状态下 /v1/* 与 /status 均不鉴权；面板登录状态取决于「面板登录」设置</td></tr>';
 }
 
 /* renderKeyList 用后端配置回填密钥表。老配置只有单值 api_key：显示成一条
@@ -1414,6 +1592,8 @@ function keysBad(rows) {
    5 秒轮询时 401，而面板没有第二个入口能改 LS_KEY，锁在门外就再也回不来。
    所以能自动换就自动换，一把能用的都没有才弹门要人输。 */
 function syncSessionKey(prevKeys, now) {
+  // 用户名密码模式下，API Key 只服务 /v1/*，不再决定面板能否进入。
+  if (typeof authMode !== 'undefined' && authMode === 'password') return;
   const cur = String(localStorage.getItem(LS_KEY) || '');
   if (!cur) return;
   if (now.some(k => k.key === cur && k.enabled)) return;
@@ -1455,8 +1635,12 @@ $('cfgKeyList').addEventListener('click', ev => {
   cfgKeyRows = readRows();
   const gone = cfgKeyRows[i];
   // 删最后一行的语义不是"少一把"，是"关闭鉴权"，必须说清楚：不可逆且代价不小。
+  const panelProtected = authMode === 'password' &&
+    (!$('cfgForm').elements.panel_auth_enabled || $('cfgForm').elements.panel_auth_enabled.checked);
   const tip = cfgKeyRows.length <= 1
-    ? '删除后将没有任何密钥，/v1/*、/status 与面板自身都不再鉴权（等于把网关公开）。确认删除？'
+    ? (panelProtected
+      ? '删除后将没有任何密钥，/v1/* 与 /status 不再鉴权（等于把网关公开）；面板仍由用户名密码保护。确认删除？'
+      : '删除后将没有任何密钥，/v1/*、/status 与面板自身都不再鉴权（等于把网关公开）。确认删除？')
     : '删除密钥「' + gone.name + '」？正在使用它的调用方会立即 401。';
   if (!confirm(tip)) return;
   cfgKeyRows.splice(i, 1);
@@ -1491,13 +1675,29 @@ $('cfgForm').onsubmit = async ev => {
   // 同样会走到这里，却没有任何警示——保存后网关立刻匿名可访问，且访问日志的
   // 密钥列全空，排查时极易被误当成"日志功能坏了"。两条路径必须同样拦一次。
   if (keys.length && !keys.some(k => k.enabled)) {
-    if (!confirm('当前没有任何启用的密钥。保存后 /v1/*、/status 与面板自身都不再鉴权，' +
+    const panelToggle = $('cfgForm').elements.panel_auth_enabled;
+    const panelProtected = panelToggle ? !!panelToggle.checked : authMode === 'password';
+    const scope = panelProtected ? '/v1/* 与 /status' : '/v1/*、/status 与面板自身';
+    if (!confirm('当前没有任何启用的密钥。保存后 ' + scope + ' 不再鉴权，' +
       '等于把网关公开给任何能访问到该端口的人。\n确认保存？')) return;
   }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
     const payload = collectConfig();
+    const pw = $('panelAuthPassword').value;
+    const pw2 = $('panelAuthPassword2').value;
+    const panelEnabled = !!(payload.panel_auth && payload.panel_auth.enabled);
+    const passwordConfigured = !!(cfgLoaded && cfgLoaded.panel_auth && cfgLoaded.panel_auth.password_configured);
+    if (pw || pw2) {
+      if (pw.length < 8) { toast('面板密码至少 8 个字符。', 'err'); return; }
+      if (pw !== pw2) { toast('两次输入的面板密码不一致。', 'err'); return; }
+      payload.panel_password = pw;
+    }
+    if (panelEnabled && !pw && !passwordConfigured) {
+      toast('首次启用用户名密码登录必须设置新密码。', 'err');
+      return;
+    }
     payload.api_keys = keys;
     // api_key 必须显式发空串：saveConfig 是浅合并，只发 api_keys 时磁盘上的旧
     // api_key 会活成一条表里看不见的「默认」密钥，"删空 = 关掉鉴权"也就永远关不掉。
@@ -1507,8 +1707,18 @@ $('cfgForm').onsubmit = async ev => {
     toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
     if (keyNotice) toast(keyNotice);
     syncSessionKey(prevKeys, keys);
-    loadConfig();
-    loadOverview(true);
+    // 面板登录配置可能让当前会话失效，先重新读取认证状态，避免继续弹出错误的
+    // 密钥窗口；仍有会话时 refreshAuthState 也会刷新 CSRF token。
+    refreshAuthState().then(d => {
+      if (d.authenticated) {
+        loadConfig();
+        loadOverview(true);
+      } else if (d.configured) {
+        openLogin('面板登录设置已更新，请重新登录。');
+      } else if (d.method === 'api_key') {
+        openKey('面板鉴权已切换，请输入 API Key。');
+      }
+    }).catch(() => openLogin('登录状态已变化，请重新登录。'));
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
@@ -1585,10 +1795,15 @@ $('importFile').onchange = async () => {
   const fd = new FormData();
   fd.append('file', file);
   const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
+  if (authMode !== 'password' && authMode !== 'none') {
+    const k = localStorage.getItem(LS_KEY);
+    if (k) h['Authorization'] = 'Bearer ' + k;
+  }
+  if (csrfToken) h['X-CSRF-Token'] = csrfToken;
   try {
-    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
+    const r = await fetch('/panel/api/import/cockpit', {
+      method: 'POST', body: fd, headers: h, credentials: 'same-origin',
+    });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     $('importDone').hidden = false;
@@ -1802,13 +2017,8 @@ function start() {
   loadCompensation();                       // 补偿状态：首次进页面查一次（之后靠新鲜窗口）
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
-  checkAuthGate();
 }
-async function checkAuthGate() {
-  try { await api('overview'); }
-  catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
-}
-start();
+bootstrapAuth();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null;

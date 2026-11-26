@@ -12,6 +12,7 @@ data/
 /credit
 /wb2api
 /signin_bin
+/panelpass
 
 # Config with secrets (use config.example.json)
 config.json
@@ -39,6 +40,7 @@ docs/
 /wb2api.exe
 /login.exe
 /credit.exe
+/panelpass.exe
 
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/

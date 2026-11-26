@@ -24,7 +24,7 @@ type APIKey struct {
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKeys              []APIKey            // 网关/面板共同鉴权密钥表；无启用项 = 不鉴权
+	APIKeys              []APIKey            // 网关密钥表；panel_auth 兼容模式下也可访问面板
 	SoftCooldown         time.Duration       // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool                // 出站请求体指纹脱敏
 	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）

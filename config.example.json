@@ -13,6 +13,13 @@
   "panel": {
     "package_detail_limit": 5
   },
+  "panel_auth": {
+    "enabled": false,
+    "username": "admin",
+    "password_hash": "",
+    "session_ttl": "12h",
+    "allow_api_key": false
+  },
   "logging": {
     "request_archive_enabled": true,
     "request_retention_days": 7,
