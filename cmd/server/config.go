@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,8 @@ type APIKeyEntry struct {
 	Name    string `json:"name"`
 	Key     string `json:"key"`
 	Enabled *bool  `json:"enabled,omitempty"`
+	// DailyCreditLimit 每日已结算积分上限；0 = 不限。
+	DailyCreditLimit float64 `json:"daily_credit_limit,omitempty"`
 }
 
 // enabled 归一：nil 视为启用。
@@ -63,9 +66,10 @@ func effectiveAPIKeys(entries []APIKeyEntry, legacy string) []httpauth.APIKey {
 			name = DefaultKeyName
 		}
 		out = append(out, httpauth.APIKey{
-			Name:    name,
-			Key:     key,
-			Enabled: e.enabled(),
+			Name:             name,
+			Key:              key,
+			Enabled:          e.enabled(),
+			DailyCreditLimit: e.DailyCreditLimit,
 		})
 		seen[key] = true
 	}
@@ -749,6 +753,9 @@ func (c *Config) normalizeAPIKeys() error {
 		k := strings.TrimSpace(e.Key)
 		if k == "" {
 			return fmt.Errorf("api_keys[%d] (name=%q): key 不能为空；留空表示不启用鉴权，请删掉这一项而不是留空 key", i, e.Name)
+		}
+		if e.DailyCreditLimit < 0 || math.IsNaN(e.DailyCreditLimit) || math.IsInf(e.DailyCreditLimit, 0) {
+			return fmt.Errorf("api_keys[%d] (name=%q): daily_credit_limit 必须是非负数（0 = 不限）", i, e.Name)
 		}
 		if keys[k] {
 			return fmt.Errorf("api_keys[%d] (name=%q): key 值重复，同一个密钥不能登记两次", i, e.Name)

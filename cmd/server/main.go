@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -58,7 +59,12 @@ func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
 	}
 	out := make([]livecfg.APIKey, 0, len(ks))
 	for _, k := range ks {
-		out = append(out, livecfg.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+		out = append(out, livecfg.APIKey{
+			Name:             k.Name,
+			Key:              k.Key,
+			Enabled:          k.Enabled,
+			DailyCreditLimit: k.DailyCreditLimit,
+		})
 	}
 	return out
 }
@@ -284,6 +290,13 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// API 密钥每日额度账本：只保存密钥指纹与已结算 usage.credit，不保存密钥明文。
+	quotaPath := stateSibling(cfg.StateFile, "key-quota.json")
+	quota := keyquota.New(quotaPath)
+	quota.Start()
+	defer quota.Stop()
+	log.Printf("[keyquota] API 密钥每日额度账本已启用: %s", quotaPath)
+
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
 		Dir:           stateSibling(cfg.StateFile, "request-logs"),
@@ -353,6 +366,7 @@ func main() {
 		Panel:        pn,
 		Live:         live,
 		Usage:        rec,
+		Quota:        quota,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,

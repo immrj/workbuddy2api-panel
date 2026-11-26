@@ -16,9 +16,10 @@ import (
 
 // APIKey 一条鉴权密钥（与 httpauth.APIKey 同形，让本包不必依赖网关包）。
 type APIKey struct {
-	Name    string
-	Key     string
-	Enabled bool
+	Name             string
+	Key              string
+	Enabled          bool
+	DailyCreditLimit float64
 }
 
 // Snapshot 一次读取的不可变配置视图。

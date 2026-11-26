@@ -1311,17 +1311,19 @@ function genKeyValue() {
 function paintKeyRows() {
   const tb = $('cfgKeyList');
   if (!tb) return;
-  const inp = (cls, type, v, aria) =>
-    '<input class="' + cls + '" type="' + type + '" value="' + esc(v) + '" aria-label="' + esc(aria) + '">';
+  const inp = (cls, type, v, aria, extra) =>
+    '<input class="' + cls + '" type="' + type + '" value="' + esc(v) + '" aria-label="' + esc(aria) + '"' + (extra || '') + '>';
   tb.innerHTML = cfgKeyRows.map((k, i) =>
     '<tr>' +
       '<td>' + inp('k-name', 'text', k.name, '第 ' + (i + 1) + ' 行密钥名称') + '</td>' +
       '<td>' + inp('k-val', keyShown ? 'text' : 'password', k.key, '第 ' + (i + 1) + ' 行密钥值') + '</td>' +
+      '<td class="num">' + inp('k-limit', 'number', k.daily_credit_limit > 0 ? k.daily_credit_limit : '',
+        '第 ' + (i + 1) + ' 行每日积分上限', ' min="0" step="any" placeholder="不限"') + '</td>' +
       '<td class="num"><input class="k-on" type="checkbox"' + (k.enabled ? ' checked' : '') +
         ' aria-label="启用第 ' + (i + 1) + ' 行密钥"></td>' +
       '<td class="c-acts"><button type="button" class="xs" data-kdel="' + i + '">删除</button></td>' +
     '</tr>'
-  ).join('') || '<tr><td colspan="4" class="empty">尚无密钥 —— 该状态下 /v1/*、/status 与面板自身均不鉴权</td></tr>';
+  ).join('') || '<tr><td colspan="5" class="empty">尚无密钥 —— 该状态下 /v1/*、/status 与面板自身均不鉴权</td></tr>';
 }
 
 /* renderKeyList 用后端配置回填密钥表。老配置只有单值 api_key：显示成一条
@@ -1336,6 +1338,10 @@ function renderKeyList(cfg) {
     name: String(k && k.name || ''),
     key: String(k && k.key || ''),
     enabled: !(k && k.enabled === false),
+    daily_credit_limit: (() => {
+      const n = Number(k && k.daily_credit_limit);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    })(),
   }));
   paintKeyRows();
 }
@@ -1347,9 +1353,15 @@ function readRows() {
   const tb = $('cfgKeyList');
   if (!tb) return rows;
   tb.querySelectorAll('tr').forEach(tr => {
-    const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val'), o = tr.querySelector('.k-on');
+    const n = tr.querySelector('.k-name'), v = tr.querySelector('.k-val'), l = tr.querySelector('.k-limit'), o = tr.querySelector('.k-on');
     if (!n || !v) return;   // 空态那一行没有输入框
-    rows.push({ name: n.value.trim(), key: v.value.trim(), enabled: !!(o && o.checked) });
+    const rawLimit = l ? l.value.trim() : '';
+    rows.push({
+      name: n.value.trim(),
+      key: v.value.trim(),
+      daily_credit_limit: rawLimit === '' ? 0 : Number(rawLimit),
+      enabled: !!(o && o.checked),
+    });
   });
   return rows;
 }
@@ -1387,6 +1399,10 @@ function keysBad(rows) {
     // 空值先拦：genKeyValue 在 crypto 不可用时会给空串，此时必须在面板里说清楚
     // 是哪一行，而不是发出去让后端回一条 400 让用户自己猜。
     if (!k.key) return '密钥「' + k.name + '」没有值：请手工填写，或删掉这一行（留空无法保存）。';
+    const limit = k.daily_credit_limit == null ? 0 : Number(k.daily_credit_limit);
+    if (!Number.isFinite(limit) || limit < 0) {
+      return '密钥「' + k.name + '」的每日积分上限必须是非负数（留空或 0 = 不限）。';
+    }
     if (seen.has(k.name)) return '密钥名称「' + k.name + '」重复：名称是日志与用量里的归属标识，必须唯一。';
     seen.add(k.name);
   }
@@ -1418,10 +1434,16 @@ function syncSessionKey(prevKeys, now) {
 $('btnKeyAdd').onclick = () => {
   // 先把已编辑但未保存的行收进内存，否则重绘会把用户刚打的名字吃掉。
   cfgKeyRows = readRows();
-  const nameEl = $('keyNewName'), valEl = $('keyNewVal');
+  const nameEl = $('keyNewName'), valEl = $('keyNewVal'), limitEl = $('keyNewLimit');
   const name = nameEl.value.trim() || ('密钥' + (cfgKeyRows.length + 1));
-  cfgKeyRows.push({ name, key: (valEl.value.trim() || genKeyValue()), enabled: true });
-  nameEl.value = ''; valEl.value = '';
+  const rawLimit = limitEl && limitEl.value.trim() ? limitEl.value.trim() : '';
+  const limit = rawLimit === '' ? 0 : Number(rawLimit);
+  if (!Number.isFinite(limit) || limit < 0) {
+    toast('每日积分上限必须是非负数（留空或 0 = 不限）。', 'err');
+    return;
+  }
+  cfgKeyRows.push({ name, key: (valEl.value.trim() || genKeyValue()), daily_credit_limit: limit, enabled: true });
+  nameEl.value = ''; valEl.value = ''; if (limitEl) limitEl.value = '';
   paintKeyRows();
 };
 $('keyNewVal').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKeyAdd').click(); });

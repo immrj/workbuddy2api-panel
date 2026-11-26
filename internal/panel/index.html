@@ -179,8 +179,10 @@ input[type=checkbox] { width: auto; accent-color: var(--accent); }
 .fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
 .fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
 /* 密钥新增行：输入默认 width:100%，两个等宽各占一半会把长密钥挤成一截。 */
-#keyNewName { flex: 0 0 24%; }
+#keyNewName { flex: 0 0 20%; }
 #keyNewVal { flex: 1 1 auto; min-width: 0; }
+#keyNewLimit { flex: 0 0 16%; min-width: 110px; }
+#cfgKeyList .k-limit { min-width: 110px; text-align: right; }
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
@@ -964,7 +966,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <div class="tbl-wrap">
                 <table class="acc zebra">
                   <thead><tr>
-                    <th>名称</th><th>密钥值</th><th class="c-acts">启用</th><th class="c-acts">操作</th>
+                    <th>名称</th><th>密钥值</th><th class="num">每日积分上限</th><th class="c-acts">启用</th><th class="c-acts">操作</th>
                   </tr></thead>
                   <tbody id="cfgKeyList"></tbody>
                 </table>
@@ -972,10 +974,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <div class="inline">
                 <input id="keyNewName" placeholder="新密钥名称" aria-label="新密钥名称">
                 <input id="keyNewVal" placeholder="留空自动生成" aria-label="新密钥值">
+                <input id="keyNewLimit" type="number" min="0" step="any" placeholder="每日上限（空=不限）" aria-label="新密钥每日积分上限">
                 <button type="button" class="xs" id="btnKeyAdd">添加密钥</button>
                 <button type="button" class="xs" id="btnEye">显示值</button>
               </div>
-              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。全删 = 关闭鉴权。</span>
+              <span class="hint">名称是运行日志与用量里的归属标识，必须唯一；留空的密钥值会自动生成。每日上限按已结算 usage.credit 计算，只限制 /v1/chat/completions；空或 0 = 不限。全删 = 关闭鉴权。</span>
             </div>
           </div>
         </div>

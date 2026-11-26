@@ -234,7 +234,12 @@ func (p *Panel) apiKeys() []httpauth.APIKey {
 func (p *Panel) liveKeys(ks []livecfg.APIKey) []httpauth.APIKey {
 	out := make([]httpauth.APIKey, 0, len(ks))
 	for _, k := range ks {
-		out = append(out, httpauth.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+		out = append(out, httpauth.APIKey{
+			Name:             k.Name,
+			Key:              k.Key,
+			Enabled:          k.Enabled,
+			DailyCreditLimit: k.DailyCreditLimit,
+		})
 	}
 	return out
 }

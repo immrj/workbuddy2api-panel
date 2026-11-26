@@ -9,10 +9,10 @@ import "testing"
 // 或就地改元素，就会在每个并发请求读快照时与之数据竞争——这类竞争通常不立刻
 // 崩，只会让密钥偶尔"变成别人的"，极难排查。
 func TestLoadCopiesSlice(t *testing.T) {
-	h := New(Snapshot{APIKeys: []APIKey{{Name: "prod", Key: "k1", Enabled: true}}})
+	h := New(Snapshot{APIKeys: []APIKey{{Name: "prod", Key: "k1", Enabled: true, DailyCreditLimit: 25}}})
 
 	got := h.Load()
-	if len(got.APIKeys) != 1 || got.APIKeys[0].Name != "prod" {
+	if len(got.APIKeys) != 1 || got.APIKeys[0].Name != "prod" || got.APIKeys[0].DailyCreditLimit != 25 {
 		t.Fatalf("Load 应返回原值，实际 %+v", got.APIKeys)
 	}
 

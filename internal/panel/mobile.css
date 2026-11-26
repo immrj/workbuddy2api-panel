@@ -266,6 +266,9 @@
   .box > header .note { white-space: normal; }
   .box .pad { padding: 11px; }
   .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); }
+  /* 密钥新增行在窄屏改为纵向堆叠，避免名称/密钥/额度/按钮互相挤压。 */
+  .inline { flex-wrap: wrap; }
+  #keyNewName, #keyNewVal, #keyNewLimit { flex: 1 1 100%; min-width: 0; }
   /* 任务中心：每项也是一张卡（标题+状态 / 进度+编码 / 信息） */
   .qgroup { padding: 0 0 12px; }
   .qgroup header { padding: 6px 2px 6px; }

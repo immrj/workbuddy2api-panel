@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -73,6 +75,10 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// Quota 按 API 密钥归属的每日已结算积分账本。
+	// nil 时 NewHandler 会创建纯内存账本，保证静态装配和测试也能执行额度判断。
+	Quota *keyquota.Ledger
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
@@ -142,6 +148,9 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
+	if cfg.Quota == nil {
+		cfg.Quota = keyquota.New("")
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
@@ -201,6 +210,22 @@ func isSearchPath(path string) bool {
 	return path == "/v1/search/messages"
 }
 
+type authenticatedAPIKey struct {
+	Name             string
+	Fingerprint      string
+	DailyCreditLimit float64
+}
+
+type authenticatedAPIKeyContextKey struct{}
+
+func authenticatedAPIKeyFrom(ctx context.Context) (authenticatedAPIKey, bool) {
+	if ctx == nil {
+		return authenticatedAPIKey{}, false
+	}
+	v, ok := ctx.Value(authenticatedAPIKeyContextKey{}).(authenticatedAPIKey)
+	return v, ok
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key, ok := httpauth.VerifyAnyBearer(r, h.loadKeys())
@@ -217,8 +242,67 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			tr.apiKey = logfmt.MaskKey(key.Key)
 			tr.apiKeyName = key.Name
 		}
+		authKey := authenticatedAPIKey{
+			Name:             key.Name,
+			Fingerprint:      keyquota.Fingerprint(key.Key),
+			DailyCreditLimit: key.DailyCreditLimit,
+		}
+		if key.Key != "" {
+			r = r.WithContext(context.WithValue(r.Context(), authenticatedAPIKeyContextKey{}, authKey))
+		}
+		if !h.allowChatByDailyLimit(w, r, authKey) {
+			return
+		}
 		next(w, r)
 	}
+}
+
+// allowChatByDailyLimit 对聊天入口执行轻量每日额度检查。
+//
+// 只在请求前读取“已经结算”的 usage.credit，不做成本预估或预留，因此达到上限后
+// 会拒绝下一次请求，但触发上限的那一条请求仍可能把额度小幅超出。状态、模型
+// 列表和搜索入口不做积分额度拒绝；搜索当前不会产生可归属的 usage.credit。
+func (h *Handler) allowChatByDailyLimit(w http.ResponseWriter, r *http.Request, key authenticatedAPIKey) bool {
+	if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" ||
+		key.Fingerprint == "" || key.DailyCreditLimit <= 0 || h.cfg.Quota == nil {
+		return true
+	}
+	now := time.Now()
+	used := h.cfg.Quota.UsedID(key.Fingerprint, now)
+	remaining := key.DailyCreditLimit - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	w.Header().Set("X-Daily-Credit-Limit", formatCreditValue(key.DailyCreditLimit))
+	w.Header().Set("X-Daily-Credit-Used", formatCreditValue(used))
+	w.Header().Set("X-Daily-Credit-Remaining", formatCreditValue(remaining))
+	if used < key.DailyCreditLimit {
+		return true
+	}
+
+	resetAt := keyquota.NextReset(now)
+	secs := int(resetAt.Sub(now).Seconds())
+	if secs < 1 {
+		secs = 1
+	} else if !resetAt.Equal(now.Add(time.Duration(secs) * time.Second)) {
+		secs++
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf(
+				"daily credit limit exceeded: used %s/%s, resets at %s",
+				formatCreditValue(used), formatCreditValue(key.DailyCreditLimit), resetAt.Format(time.RFC3339),
+			),
+			"type": "insufficient_quota",
+			"code": "daily_credit_limit_exceeded",
+		},
+	})
+	return false
+}
+
+func formatCreditValue(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // loadKeys 当前生效密钥表：配了 Live 就以 Live 为准，否则回落静态字段。
@@ -234,7 +318,12 @@ func (h *Handler) loadKeys() []httpauth.APIKey {
 		live := h.cfg.Live.Load()
 		out := make([]httpauth.APIKey, 0, len(live.APIKeys))
 		for _, k := range live.APIKeys {
-			out = append(out, httpauth.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+			out = append(out, httpauth.APIKey{
+				Name:             k.Name,
+				Key:              k.Key,
+				Enabled:          k.Enabled,
+				DailyCreditLimit: k.DailyCreditLimit,
+			})
 		}
 		return out
 	}
@@ -250,7 +339,12 @@ func toLiveKeys(ks []httpauth.APIKey) []livecfg.APIKey {
 	}
 	out := make([]livecfg.APIKey, 0, len(ks))
 	for _, k := range ks {
-		out = append(out, livecfg.APIKey{Name: k.Name, Key: k.Key, Enabled: k.Enabled})
+		out = append(out, livecfg.APIKey{
+			Name:             k.Name,
+			Key:              k.Key,
+			Enabled:          k.Enabled,
+			DailyCreditLimit: k.DailyCreditLimit,
+		})
 	}
 	return out
 }
@@ -785,7 +879,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 密钥维度取自 requestTrace（withAuth 鉴权时回填的名称）。为空时
 			// AddWithKey 会归一到"默认"，与存量数据保持同一归属口径。
 			var apiKeyName string
-			if tr := requestTraceFrom(r); tr != nil {
+			if key, ok := authenticatedAPIKeyFrom(r.Context()); ok {
+				apiKeyName = key.Name
+			} else if tr := requestTraceFrom(r); tr != nil {
 				apiKeyName = tr.apiKeyName
 			}
 			h.cfg.Usage.AddWithKey(time.Now(), realm, uid, delta.Model, apiKeyName, usage.Delta{
@@ -806,6 +902,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		}
+		if key, ok := authenticatedAPIKeyFrom(r.Context()); ok && key.Fingerprint != "" && hasCredit && credit > 0 {
+			h.cfg.Quota.SettleID(key.Fingerprint, time.Now(), credit)
 		}
 	}
 

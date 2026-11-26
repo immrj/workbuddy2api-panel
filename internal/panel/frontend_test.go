@@ -926,11 +926,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function genKeyValue');
 const end = src.indexOf("$('btnKeyAdd')");
 if (start < 0 || end < 0 || end < start) throw new Error('collectKeys region not found');
-const mkRow = (name, key, on) => {
-  const els = { '.k-name': { value: name }, '.k-val': { value: key }, '.k-on': { checked: on } };
+const mkRow = (name, key, limit, on) => {
+  const els = { '.k-name': { value: name }, '.k-val': { value: key }, '.k-limit': { value: limit }, '.k-on': { checked: on } };
   return { querySelector: sel => els[sel] || null, _els: els };
 };
-const rows = [mkRow('', '', true), mkRow('prod', 'sk-live', true), mkRow('old', 'sk-old', false)];
+const rows = [mkRow('', '', '25', true), mkRow('prod', 'sk-live', '', true), mkRow('old', 'sk-old', '100', false)];
 const tb = { querySelectorAll: () => rows };
 const ctx = {
   esc: s => String(s == null ? '' : s),
@@ -945,11 +945,13 @@ process.stdout.write(JSON.stringify({
   names: keys.map(k => k.name),
   firstKeyGenerated: keys[0].key.indexOf('sk-') === 0 && keys[0].key.length > 10,
   kept: [keys[1].key, keys[1].enabled, keys[2].key, keys[2].enabled],
+  limits: keys.map(k => k.daily_credit_limit),
   writtenBack: [rows[0]._els['.k-name'].value === keys[0].name, rows[0]._els['.k-val'].value === keys[0].key],
   dupBad: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }, { name: 'a', key: 'k3' }]) !== '',
   uniqOk: ctx.keysBad([{ name: 'a', key: 'k1' }, { name: 'b', key: 'k2' }]) === '',
   emptyKeyBad: ctx.keysBad([{ name: 'a', key: '' }]) !== '',
   emptyKeyMsg: ctx.keysBad([{ name: 'a', key: '' }]).indexOf('a') >= 0,
+  negativeLimitBad: ctx.keysBad([{ name: 'a', key: 'k1', daily_credit_limit: -1 }]) !== '',
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "cfgk-*.cjs")
 	if err != nil {
@@ -964,9 +966,56 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("collectKeys node test failed: %v\n%s", err, out)
 	}
 	const want = `{"names":["密钥1","prod","old"],"firstKeyGenerated":true,"kept":["sk-live",true,"sk-old",false],` +
-		`"writtenBack":[true,true],"dupBad":true,"uniqOk":true,"emptyKeyBad":true,"emptyKeyMsg":true}`
+		`"limits":[25,0,100],"writtenBack":[true,true],"dupBad":true,"uniqOk":true,` +
+		`"emptyKeyBad":true,"emptyKeyMsg":true,"negativeLimitBad":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectKeys=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+func TestAppJSRenderKeyListDailyLimit(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderKeyList test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function paintKeyRows');
+const end = src.indexOf('function readRows');
+if (start < 0 || end < 0 || end < start) throw new Error('key render region not found');
+const tb = { innerHTML: '' };
+const ctx = {
+  cfgKeyRows: [], keyShown: false, Number,
+  esc: s => String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+  $: id => id === 'cfgKeyList' ? tb : null,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderKeyList=renderKeyList;this.paintKeyRows=paintKeyRows;', ctx);
+ctx.renderKeyList({ api_keys: [
+  { name: 'prod', key: 'sk-prod', enabled: true, daily_credit_limit: 25.5 },
+  { name: 'qa', key: 'sk-qa', enabled: true },
+] });
+process.stdout.write(JSON.stringify({
+  limits: ctx.cfgKeyRows.map(k => k.daily_credit_limit),
+  hasDecimal: tb.innerHTML.includes('value="25.5"'),
+  unlimitedBlank: tb.innerHTML.includes('placeholder="不限"'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "key-render-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderKeyList node test failed: %v\n%s", err, out)
+	}
+	const want = `{"limits":[25.5,0],"hasDecimal":true,"unlimitedBlank":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("renderKeyList=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }
 

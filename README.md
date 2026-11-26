@@ -392,7 +392,7 @@ curl -s http://localhost:7863/v1/search/messages \
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 单条网关鉴权密钥（**向后兼容的旧字段**）；空 = 不鉴权。新配置建议改用 `api_keys` |
-| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**，任一启用密钥都能通过网关与面板鉴权；**生效表中没有启用的密钥（表为空或全部停用）= 不鉴权** |
+| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true,"daily_credit_limit":50}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。`daily_credit_limit` 是该密钥每个**本地自然日**的已结算积分上限，`0` / 缺省 = 不限；达到上限后拒绝下一次 `/v1/chat/completions`（`429 daily_credit_limit_exceeded`），不改动状态、模型列表、搜索与面板访问。积分只在上游返回 `usage.credit` 后结算，因此触发上限的那一条请求可能小幅超出。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**，任一启用密钥都能通过网关与面板鉴权；**生效表中没有启用的密钥（表为空或全部停用）= 不鉴权** |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
@@ -777,7 +777,7 @@ http://127.0.0.1:7863/panel/
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
-**配置热生效**：保存配置后，`api_key` / `api_keys`（增删密钥、启停密钥**下一个请求即生效，无需重启**）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key` / `api_keys`（增删密钥、启停密钥、修改 `daily_credit_limit`**下一个请求即生效，无需重启**）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -946,7 +946,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 - 多账号复制 `auths/workbuddy-<uid>.json` 即可，池启动时自动对齐目录
 - Session 失效账号被禁用（`disabled_reason` 透出在 `/status`）后，可用 `./login.sh` 重新登录覆盖凭证；已持久化 `disabled=true` 的账号可在源码侧调用 `Pool.ReviveDisabled(uid)` 复活（`state.json` 中清除 `disabled` 标志）
-- 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
+- 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）+ `data/usage.json`（用量统计）+ `data/key-quota.json`（API 密钥每日已结算积分）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
 
 ## 安全与合规
 

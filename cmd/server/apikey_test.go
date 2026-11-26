@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 )
 
 func mustParse(t *testing.T, raw string) *Config {
@@ -81,6 +83,44 @@ func TestEffectiveAPIKeysEnabledDefault(t *testing.T) {
 	}
 	if ks[1].Enabled {
 		t.Fatal("显式 enabled:false 应为禁用")
+	}
+}
+
+// TestEffectiveAPIKeysDailyCreditLimit 每日积分上限必须随生效密钥表进入运行时，
+// 且旧单值 api_key 保持 0（不限），不对既有配置引入隐式额度。
+func TestEffectiveAPIKeysDailyCreditLimit(t *testing.T) {
+	c := mustParse(t, `{"api_key":"sk-legacy","api_keys":[
+	  {"name":"prod","key":"k1","daily_credit_limit":12.5}
+	]}`)
+	ks := c.EffectiveAPIKeys()
+	if len(ks) != 2 {
+		t.Fatalf("want 2 keys, got %+v", ks)
+	}
+	if ks[0].DailyCreditLimit != 12.5 {
+		t.Fatalf("prod limit=%v want 12.5", ks[0].DailyCreditLimit)
+	}
+	if ks[1].DailyCreditLimit != 0 {
+		t.Fatalf("legacy limit=%v want 0 (unlimited)", ks[1].DailyCreditLimit)
+	}
+}
+
+// TestNormalizeRejectsNegativeDailyCreditLimit 负额度无意义，配置保存阶段直接拒绝。
+func TestNormalizeRejectsNegativeDailyCreditLimit(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"api_keys":[{"name":"prod","key":"k1","daily_credit_limit":-1}]}`))
+	if err == nil {
+		t.Fatal("negative daily_credit_limit should be rejected")
+	}
+	if !strings.Contains(err.Error(), "daily_credit_limit") {
+		t.Fatalf("error should name the field, got %v", err)
+	}
+}
+
+func TestToLiveKeysCopiesDailyCreditLimit(t *testing.T) {
+	got := toLiveKeys([]httpauth.APIKey{{
+		Name: "prod", Key: "sk-prod", Enabled: true, DailyCreditLimit: 8.5,
+	}})
+	if len(got) != 1 || got[0].DailyCreditLimit != 8.5 {
+		t.Fatalf("toLiveKeys dropped daily limit: %+v", got)
 	}
 }
 
