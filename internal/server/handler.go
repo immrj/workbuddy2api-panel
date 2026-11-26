@@ -1376,7 +1376,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
-		credit, total, hasCredit := usageCreditTotal(resp)
+		credit, hasCredit := usageCredit(resp)
+		total, hasTotal := usageTotalTokens(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
 			if hit, miss, okC := cacheTokensFromUsage(usage); okC {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
@@ -1400,7 +1401,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if hasCredit {
 			st.credit = credit
 			st.hasCredit = true
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			if hasTotal {
+				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			}
 		}
 		return
 	}
@@ -1541,19 +1544,49 @@ func promptTooLongMessage(body string) string {
 	return body
 }
 
-// usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
-// 任一字段缺失/非法 → ok=false（不记录）。
-func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
+// usageCredit 从聚合响应取 usage.credit。积分额度只关心该字段本身，
+// 不能因为 total_tokens 缺失就漏记（流式路径同样独立采信 credit）。
+func usageCredit(resp map[string]any) (float64, bool) {
 	usage, _ := resp["usage"].(map[string]any)
 	if usage == nil {
-		return 0, 0, false
+		return 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
-		return 0, 0, false
+	return usageNumber(usage, "credit")
+}
+
+// usageTotalTokens 从聚合响应取正数 total_tokens（成本台账非流式入口）。
+func usageTotalTokens(resp map[string]any) (int, bool) {
+	usage, _ := resp["usage"].(map[string]any)
+	if usage == nil {
+		return 0, false
 	}
-	return c, int(t), true
+	n, ok := usageNumber(usage, "total_tokens")
+	if !ok || n <= 0 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+func usageNumber(usage map[string]any, key string) (float64, bool) {
+	v, ok := usage[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败

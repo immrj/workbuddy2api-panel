@@ -150,3 +150,49 @@ func TestChatSettlesCreditThenBlocksNextRequest(t *testing.T) {
 		t.Fatalf("upstream calls=%d want 1 (blocked request must not consume an account)", got)
 	}
 }
+
+func TestNonStreamCreditWithoutTotalTokensSettlesQuota(t *testing.T) {
+	const (
+		secret = "sk-settle-sync"
+		sse    = "data: {\"id\":\"chatcmpl-quota-sync\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"credit\":1.25}}\n\n" +
+			"data: [DONE]\n\n"
+	)
+	var calls atomic.Int32
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls.Add(1)
+		return http.StatusOK, sse, true
+	})
+	quota := keyquota.New("")
+	live := livecfg.New(livecfg.Snapshot{APIKeys: []livecfg.APIKey{{
+		Name: "prod", Key: secret, Enabled: true, DailyCreditLimit: 1.25,
+	}}})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Live:     live,
+		Quota:    quota,
+	})
+	body := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}`
+
+	first := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	h.ServeHTTP(first, req)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first code=%d body=%s", first.Code, first.Body)
+	}
+	if got := quota.Used(secret, time.Now()); got != 1.25 {
+		t.Fatalf("settled credit=%v want 1.25 even without total_tokens", got)
+	}
+
+	second := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	h.ServeHTTP(second, req)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second code=%d want 429, body=%s", second.Code, second.Body)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls=%d want 1 (blocked request must not consume an account)", got)
+	}
+}
