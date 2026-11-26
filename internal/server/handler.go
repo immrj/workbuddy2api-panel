@@ -802,9 +802,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// API Key 模型白名单：与 /v1/models 的列表过滤同一口径。放在选号/粘性之前，
 	// 无权限的模型不消耗账号、不进入上游，也不污染模型锁。
 	if !modelAllowedByScope(allowedModels, realm, bareModel) {
-		writeOpenAIErrorHint(w, http.StatusForbidden, "model_not_allowed",
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_not_allowed",
 			"model is not allowed for this API key, choose one from /v1/models", "")
-		st.status = http.StatusForbidden
+		st.status = http.StatusBadRequest
 		st.outcome = reqlog.OutcomeHTTPError
 		return
 	}

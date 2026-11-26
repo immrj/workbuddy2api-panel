@@ -128,8 +128,8 @@ func TestChatModelAllowlistBlocksBeforeUpstream(t *testing.T) {
 
 	for _, model := range []string{"deepseek-v3", "global:glm-5.2"} {
 		rec := post(model)
-		if rec.Code != http.StatusForbidden {
-			t.Fatalf("model %q: code=%d want 403, body=%s", model, rec.Code, rec.Body.String())
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("model %q: code=%d want 400, body=%s", model, rec.Code, rec.Body.String())
 		}
 		if !strings.Contains(rec.Body.String(), "model_not_allowed") {
 			t.Fatalf("model %q: body missing model_not_allowed: %s", model, rec.Body.String())
@@ -155,8 +155,8 @@ func TestChatModelAllowlistBlocksBeforeUpstream(t *testing.T) {
 		AllowedModels: []string{"cn:deepseek-v3"},
 	}}})
 	rec := post("glm-5.2")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("after hot reload code=%d want 403, body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("after hot reload code=%d want 400, body=%s", rec.Code, rec.Body.String())
 	}
 	if calls != 2 {
 		t.Fatalf("hot-reload denied model reached upstream: calls=%d", calls)

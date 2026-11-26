@@ -207,7 +207,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 上游改动 | 吸收内容 |
 |---|---|
 | 联网搜索 | `POST /v1/search/messages`（Anthropic Messages 兼容）：搜索客户端、请求日志记账、README 说明 |
-| 模型可见性 | 全局 `models.hidden` 黑名单 + 每把 API Key 的 `allowed_models` 白名单：`/v1/models` 按当前 Key 过滤，chat 点名越权直接拒绝（403 `model_not_allowed`），面板下拉多选，热生效 |
+| 模型可见性 | 全局 `models.hidden` 黑名单 + 每把 API Key 的 `allowed_models` 白名单：`/v1/models` 按当前 Key 过滤，chat 点名越权直接拒绝（400 `model_not_allowed`），面板下拉多选，热生效 |
 | 出站与配置 | `dns_servers` / `WB2A_DNS` 指定出站 DNS、`cn.chat_base` 覆盖国内版 base、环境变量代理、`pool.account_order` |
 | 调度 | `pool.strategy` 按地区独立策略（`weighted_random` / `round_robin` / `sequential_exhaust`），支持热更新 |
 | 稳定性 | 6021 queue.full 归通道级忙闲、同账号 refresh 单飞（12153）、6004 双时钟、软冷却到期不再透出过期 reason、缓存告警假阳性、国际版 11-128 分流与 `X-Conversation-ID`、11158 权限错误、剥离 `reasoning_text`（Codex 11101） |
@@ -392,7 +392,7 @@ curl -s http://localhost:7863/v1/search/messages \
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 单条网关鉴权密钥（**向后兼容的旧字段**）；空 = 不鉴权。该字段不支持 `allowed_models`，要按 Key 限制模型请迁移到 `api_keys` |
-| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true,"daily_credit_limit":50,"allowed_models":["cn:glm-5.2","global:gpt-5.6-sol"]}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。`daily_credit_limit` 是该密钥每个**本地自然日**的已结算积分上限，`0` / 缺省 = 不限；达到上限后拒绝下一次 `/v1/chat/completions`（`429 daily_credit_limit_exceeded`），不改动状态、模型列表或搜索。积分只在上游返回 `usage.credit` 后结算，因此触发上限的那一条请求可能小幅超出。`allowed_models` 是该密钥的模型白名单：缺省/空数组 = 不限制；非空 = 只允许列表内模型，裸名同时允许 CN/global 两域，`cn:`/`global:` 前缀精确到域。白名单同时过滤 `/v1/models` 并在 `/v1/chat/completions` 前强制校验（`403 model_not_allowed`，不打上游）；`models.hidden` 优先级更高。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**；未启用 `panel_auth` 时任一启用密钥也能访问面板，**生效表中没有启用的密钥（表为空或全部停用）= 网关不鉴权** |
+| `api_keys` | `[]` | 多密钥表：`[{"name":"prod","key":"sk-…","enabled":true,"daily_credit_limit":50,"allowed_models":["cn:glm-5.2","global:gpt-5.6-sol"]}]`。`name` 是日志与用量里的**归属标识，必须唯一**（与旧 `api_key` 自动占用的名称 `默认` 也不能重名）；`enabled` 缺省 `true`。`daily_credit_limit` 是该密钥每个**本地自然日**的已结算积分上限，`0` / 缺省 = 不限；达到上限后拒绝下一次 `/v1/chat/completions`（`429 daily_credit_limit_exceeded`），不改动状态、模型列表或搜索。积分只在上游返回 `usage.credit` 后结算，因此触发上限的那一条请求可能小幅超出。`allowed_models` 是该密钥的模型白名单：缺省/空数组 = 不限制；非空 = 只允许列表内模型，裸名同时允许 CN/global 两域，`cn:`/`global:` 前缀精确到域。白名单同时过滤 `/v1/models` 并在 `/v1/chat/completions` 前强制校验（`400 model_not_allowed`，不打上游）；`models.hidden` 优先级更高。表内所有密钥与旧 `api_key` 共同构成**生效密钥表**；未启用 `panel_auth` 时任一启用密钥也能访问面板，**生效表中没有启用的密钥（表为空或全部停用）= 网关不鉴权** |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
@@ -833,7 +833,7 @@ docker compose exec wb2api /app/panelpass
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（有启用密钥时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB；模型不在当前 Key 的 `allowed_models` 内时返回 `403 model_not_allowed`，不请求上游 |
+| `POST /v1/chat/completions` | Bearer（有启用密钥时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB；模型不在当前 Key 的 `allowed_models` 内时返回 `400 model_not_allowed`，不请求上游 |
 | `GET /v1/models` | Bearer（有启用密钥时） | 模型列表（纯动态拉取，缓存 10min；失败返回空列表 + 5min 负缓存）；按当前 API Key 的 `allowed_models` 过滤；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（有启用密钥时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
